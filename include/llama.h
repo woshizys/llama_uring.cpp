@@ -310,6 +310,12 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // Optional opaque Rust ExpertManager pointer. When set, llama.cpp will
+        // register MoE expert tensor slices during model loading and call
+        // ensure/release around CPU GGML_OP_MUL_MAT_ID execution.
+        void * expert_manager;
+        size_t expert_cache_capacity;       // auto-create ExpertManager when > 0 and expert_manager is NULL
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -319,6 +325,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool expert_manager_owned; // if true, llama_model owns and frees expert_manager
     };
 
     struct llama_sampler_seq_config {

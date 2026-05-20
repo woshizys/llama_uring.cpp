@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+class ExpertManager;
 
 // available models
 enum llm_type {
@@ -567,6 +568,9 @@ struct llama_model {
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+
+    std::unique_ptr<ExpertManager> expert_manager;
+    std::vector<const ggml_tensor *> expert_manager_tensors;
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;

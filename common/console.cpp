@@ -70,6 +70,7 @@ namespace console {
     static bool         advanced_display = false;
     static bool         simple_io        = true;
     static display_type current_display  = DISPLAY_TYPE_RESET;
+    static bool         last_input_eof   = false;
 
     static FILE*        out              = stdout;
 
@@ -751,6 +752,7 @@ namespace console {
     } history;
 
     static bool readline_advanced(std::string & line, bool multiline_input) {
+        last_input_eof = false;
         if (out != stdout) {
             fflush(stdout);
         }
@@ -809,6 +811,7 @@ namespace console {
             }
 
             if (input_char == (char32_t) WEOF || input_char == 0x04 /* Ctrl+D */) {
+                last_input_eof = true;
                 end_of_stream = true;
                 break;
             }
@@ -1044,11 +1047,13 @@ namespace console {
     }
 
     static bool readline_simple(std::string & line, bool multiline_input) {
+        last_input_eof = false;
 #if defined(_WIN32)
         std::wstring wline;
         if (!std::getline(std::wcin, wline)) {
             // Input stream is bad or EOF received
             line.clear();
+            last_input_eof = true;
             GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
             return false;
         }
@@ -1060,6 +1065,7 @@ namespace console {
         if (!std::getline(std::cin, line)) {
             // Input stream is bad or EOF received
             line.clear();
+            last_input_eof = true;
             return false;
         }
 #endif
@@ -1085,6 +1091,10 @@ namespace console {
             return readline_simple(line, multiline_input);
         }
         return readline_advanced(line, multiline_input);
+    }
+
+    bool input_eof() {
+        return last_input_eof;
     }
 
     void set_completion_callback(completion_callback cb) {

@@ -567,6 +567,7 @@ llama_model_loader::llama_model_loader(
                 files.emplace_back(new llama_file(fname.c_str(), "rb", false));
             }
         }
+        file_paths.push_back(fname);
 
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
@@ -634,6 +635,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.push_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -1515,6 +1517,11 @@ bool llama_model_loader::load_all_data(
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
+            continue;
+        }
+
+        if (skip_load_tensors.find(ggml_get_name(cur)) != skip_load_tensors.end()) {
+            size_done += ggml_nbytes(cur);
             continue;
         }
 

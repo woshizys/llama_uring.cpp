@@ -4167,7 +4167,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
             case GGML_OP_MUL_MAT_ID:
                 {
-                    size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
+                    size = GGML_PAD(sizeof(void *), sizeof(int64_t));
+                    size += ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
                     size = GGML_PAD(size, sizeof(int64_t)); // + padding for next block.
 
                     const int64_t ne02 = op->src[0]->ne[2]; // n_as, n_expert
@@ -4394,6 +4395,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int ith = params->ith;
         const int nth = params->nth;
 
+        auto ** moe_expert_handle_slot = (void **) params->wdata;
+        if (ith == 0) {
+            *moe_expert_handle_slot = ggml_moe_expert_ensure(src0, ids);
+        }
+        ggml_barrier(params->threadpool);
+        void * moe_expert_handle = *moe_expert_handle_slot;
+
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
 
         // we don't support permuted src0 or src1
@@ -4426,11 +4434,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         };
 
         GGML_ASSERT(params->wsize >=
-                (GGML_PAD(nbw3, sizeof(int64_t)) +
+                (GGML_PAD(sizeof(void *), sizeof(int64_t)) +
+                 GGML_PAD(nbw3, sizeof(int64_t)) +
                  n_as*(ne12 + 1)*sizeof(mmid_row_mapping))
                 );
 
-        auto * wdata          = (char *)params->wdata;
+        auto * wdata          = (char *)params->wdata + GGML_PAD(sizeof(void *), sizeof(int64_t));
         auto * wdata_src1_end = (char *)wdata + GGML_PAD(nbw3, sizeof(int64_t));
 
         // total of [n_as][ne12 + 1] elements of type mmid_row_mapping (2*int32_t = int64_t)
@@ -4476,7 +4485,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 continue;
             }
 
-            const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
+            const auto * src0_cur = (const char *) ggml_moe_expert_get_data(
+                    moe_expert_handle,
+                    cur_a,
+                    src0->data != nullptr ? (const char *) src0->data + cur_a*nb02 : nullptr);
+            GGML_ASSERT(src0_cur != nullptr);
 
             //const int64_t nr0 = ne01; // src0 rows
             const int64_t nr1 = cne1; // src1 rows
@@ -4492,7 +4505,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             if (src0_cur_start >= src0_cur_end) {
-                return;
+                goto done;
             }
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {
@@ -4512,6 +4525,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
                     src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
             }
+        }
+
+done:
+        ggml_barrier(params->threadpool);
+        if (ith == 0) {
+            ggml_moe_expert_release(moe_expert_handle);
         }
 #undef MMID_MATRIX_ROW
     }

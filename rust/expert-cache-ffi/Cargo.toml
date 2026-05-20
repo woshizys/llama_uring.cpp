@@ -1,0 +1,13 @@
+[package]
+name = "llama-expert-cache-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "llama_expert_cache_ffi"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+io-scheduler = { path = "../../../InterfaceIO/io-scheduler" }
+tokio = { version = "1.0", features = ["rt-multi-thread"] }

@@ -53,6 +53,29 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (LLAMA_EXPERT_CACHE)
+    find_program(CARGO_EXECUTABLE cargo REQUIRED)
+    find_library(LLAMA_EXPERT_CACHE_URING_LIBRARY uring REQUIRED)
+    set(LLAMA_EXPERT_CACHE_FFI_MANIFEST ${CMAKE_SOURCE_DIR}/rust/expert-cache-ffi/Cargo.toml)
+    set(LLAMA_EXPERT_CACHE_FFI_LIB ${CMAKE_SOURCE_DIR}/rust/expert-cache-ffi/target/release/libllama_expert_cache_ffi.a)
+
+    add_custom_target(llama-expert-cache-ffi-build
+        COMMAND ${CARGO_EXECUTABLE} build --release --manifest-path ${LLAMA_EXPERT_CACHE_FFI_MANIFEST}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/rust/expert-cache-ffi
+        COMMENT "Building Rust io-scheduler expert cache FFI"
+        VERBATIM)
+
+    add_library(llama-expert-cache-ffi STATIC IMPORTED GLOBAL)
+    set_target_properties(llama-expert-cache-ffi PROPERTIES IMPORTED_LOCATION ${LLAMA_EXPERT_CACHE_FFI_LIB})
+    add_dependencies(llama-expert-cache-ffi llama-expert-cache-ffi-build)
+
+    target_compile_definitions(llama PRIVATE LLAMA_EXPERT_CACHE_ENABLED)
+    target_link_libraries(llama PUBLIC llama-expert-cache-ffi)
+    if (UNIX AND NOT APPLE)
+        target_link_libraries(llama PUBLIC ${LLAMA_EXPERT_CACHE_URING_LIBRARY} dl pthread m)
+    endif()
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

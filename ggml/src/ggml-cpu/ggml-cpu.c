@@ -1529,6 +1529,16 @@ static void ggml_compute_forward_mul_mat_id(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
+    void * wdata_cur = params->wdata;
+    void ** moe_expert_handle_slot =
+        incr_ptr_aligned(&wdata_cur, sizeof(void *), sizeof(void *));
+    void * moe_expert_wdata = wdata_cur;
+    if (ith == 0) {
+        *moe_expert_handle_slot = ggml_moe_expert_ensure(src0, ids);
+    }
+    ggml_barrier(params->threadpool);
+    void * moe_expert_handle = *moe_expert_handle_slot;
+
     enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
 
@@ -1546,8 +1556,6 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
-    void * wdata_cur = params->wdata;
-
     if (src1->type != vec_dot_type) {
         incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
     }
@@ -1564,7 +1572,7 @@ static void ggml_compute_forward_mul_mat_id(
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
     if (src1->type != vec_dot_type) {
-        char * wdata = params->wdata;
+        char * wdata = moe_expert_wdata;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
@@ -1632,8 +1640,12 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
-        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+        const char * src0_cur = (const char *) ggml_moe_expert_get_data(
+                moe_expert_handle,
+                cur_a,
+                src0->data != NULL ? (const char *) src0->data + cur_a * nb02 : NULL);
+        GGML_ASSERT(src0_cur != NULL);
+        const void * wdata = (src1->type == vec_dot_type) ? src1->data : moe_expert_wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
         const int64_t nr0 = ne01;
@@ -1684,6 +1696,11 @@ static void ggml_compute_forward_mul_mat_id(
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
+    }
+
+    ggml_barrier(params->threadpool);
+    if (ith == 0) {
+        ggml_moe_expert_release(moe_expert_handle);
     }
 }
 
@@ -2817,6 +2834,8 @@ struct ggml_cplan ggml_graph_plan(
                         const struct ggml_tensor * ids = node->src[2];
                         const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
                         const int n_as = src0->ne[2];
+                        // shared MoE expert cache operation handle
+                        cur += sizeof(void *) + sizeof(void *);
                         // src1
                         if (src1->type != vec_dot_type) {
                             cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);

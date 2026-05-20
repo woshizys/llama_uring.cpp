@@ -53,6 +53,42 @@
 
 #define UNUSED GGML_UNUSED
 
+static ggml_moe_expert_ensure_callback   g_moe_expert_ensure_cb   = NULL;
+static ggml_moe_expert_get_data_callback g_moe_expert_get_data_cb = NULL;
+static ggml_moe_expert_release_callback  g_moe_expert_release_cb  = NULL;
+static void * g_moe_expert_cb_data = NULL;
+
+void ggml_moe_expert_set_callback(
+        ggml_moe_expert_ensure_callback ensure,
+        ggml_moe_expert_get_data_callback get_data,
+        ggml_moe_expert_release_callback release,
+        void * data) {
+    g_moe_expert_ensure_cb = ensure;
+    g_moe_expert_get_data_cb = get_data;
+    g_moe_expert_release_cb = release;
+    g_moe_expert_cb_data = data;
+}
+
+void * ggml_moe_expert_ensure(const struct ggml_tensor * src0, const struct ggml_tensor * ids) {
+    if (g_moe_expert_ensure_cb == NULL) {
+        return NULL;
+    }
+    return g_moe_expert_ensure_cb(g_moe_expert_cb_data, src0, ids);
+}
+
+const void * ggml_moe_expert_get_data(void * handle, int32_t expert, const void * fallback) {
+    if (handle == NULL || g_moe_expert_get_data_cb == NULL) {
+        return fallback;
+    }
+    return g_moe_expert_get_data_cb(g_moe_expert_cb_data, handle, expert, fallback);
+}
+
+void ggml_moe_expert_release(void * handle) {
+    if (handle != NULL && g_moe_expert_release_cb != NULL) {
+        g_moe_expert_release_cb(g_moe_expert_cb_data, handle);
+    }
+}
+
 uint64_t ggml_graph_next_uid(void) {
 #ifdef _MSC_VER
     static volatile long long counter = 1;

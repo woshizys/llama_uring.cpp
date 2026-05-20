@@ -59,6 +59,7 @@ struct cli_context {
     std::vector<raw_buffer> input_files;
     task_params defaults;
     bool verbose_prompt;
+    bool generation_interrupted = false;
 
     // thread for showing "loading" animation
     std::atomic<bool> loading_show;
@@ -78,6 +79,7 @@ struct cli_context {
     }
 
     std::string generate_completion(result_timings & out_timings) {
+        generation_interrupted = false;
         server_response_reader rd = ctx_server.get_response_reader();
         auto chat_params = format_chat();
         {
@@ -134,6 +136,7 @@ struct cli_context {
 
         while (result) {
             if (should_stop()) {
+                generation_interrupted = true;
                 break;
             }
             if (result->is_error()) {
@@ -177,7 +180,9 @@ struct cli_context {
             }
             result = rd.next(should_stop);
         }
-        g_is_interrupted.store(false);
+        if (should_stop()) {
+            generation_interrupted = true;
+        }
         // server_response_reader automatically cancels pending tasks upon destruction
         return curr_content;
     }
@@ -468,6 +473,7 @@ int main(int argc, char ** argv) {
 
     while (true) {
         std::string buffer;
+        bool input_eof = false;
         console::set_display(DISPLAY_TYPE_USER_INPUT);
         if (params.prompt.empty()) {
             console::log("\n> ");
@@ -475,6 +481,10 @@ int main(int argc, char ** argv) {
             bool another_line = true;
             do {
                 another_line = console::readline(line, params.multiline_input);
+                if (console::input_eof()) {
+                    input_eof = true;
+                    break;
+                }
                 buffer += line;
             } while (another_line);
         } else {
@@ -497,6 +507,9 @@ int main(int argc, char ** argv) {
             params.prompt.clear(); // only use it once
         }
         console::set_display(DISPLAY_TYPE_RESET);
+        if (input_eof) {
+            break;
+        }
         console::log("\n");
 
         if (should_stop()) {
@@ -625,6 +638,11 @@ int main(int argc, char ** argv) {
             {"content", assistant_content}
         });
         console::log("\n");
+
+        if (ctx_cli.generation_interrupted) {
+            g_is_interrupted.store(false);
+            break;
+        }
 
         if (params.show_timings) {
             console::set_display(DISPLAY_TYPE_INFO);

@@ -2249,6 +2249,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
+        {"--expert-cache-capacity"}, "N",
+        "number of MoE experts to keep in the io-scheduler expert cache (0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_capacity = std::stoull(value);
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_CAPACITY"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

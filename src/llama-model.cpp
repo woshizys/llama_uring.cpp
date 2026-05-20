@@ -1,6 +1,7 @@
 #include "llama-model.h"
 
 #include "llama-arch.h"
+#include "llama-expert-manager.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
@@ -27,12 +28,200 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(LLAMA_EXPERT_CACHE_ENABLED)
+extern "C" {
+
+__attribute__((weak)) llama_expert_manager_ffi * llama_expert_manager_new(
+        size_t,
+        size_t,
+        size_t,
+        size_t) {
+    return nullptr;
+}
+
+__attribute__((weak)) llama_expert_manager_ffi * llama_expert_manager_new_with_slot_size(
+        size_t,
+        size_t) {
+    return nullptr;
+}
+
+__attribute__((weak)) llama_expert_handle_ffi * llama_expert_manager_ensure(
+        llama_expert_manager_ffi *,
+        int32_t,
+        int32_t) {
+    return nullptr;
+}
+
+__attribute__((weak)) int32_t llama_expert_manager_ensure_many(
+        llama_expert_manager_ffi *,
+        int32_t,
+        const int32_t *,
+        size_t,
+        llama_expert_handle_ffi **) {
+    return -1;
+}
+
+__attribute__((weak)) void llama_expert_manager_release(
+        llama_expert_manager_ffi *,
+        llama_expert_handle_ffi *) {
+}
+
+__attribute__((weak)) uint8_t * llama_expert_handle_host_ptr(
+        const llama_expert_handle_ffi *,
+        int32_t) {
+    return nullptr;
+}
+
+__attribute__((weak)) const uint8_t * llama_expert_handle_device_ptr(
+        const llama_expert_handle_ffi *,
+        int32_t) {
+    return nullptr;
+}
+
+__attribute__((weak)) size_t llama_expert_handle_part_size(
+        const llama_expert_handle_ffi *,
+        int32_t) {
+    return 0;
+}
+
+__attribute__((weak)) int32_t llama_expert_handle_slot_id(
+        const llama_expert_handle_ffi *) {
+    return -1;
+}
+
+__attribute__((weak)) int32_t llama_expert_manager_register_slice(
+        llama_expert_manager_ffi *,
+        int32_t,
+        int32_t,
+        const llama_expert_slice_ffi *) {
+    return -1;
+}
+
+__attribute__((weak)) int32_t llama_expert_manager_register_file(
+        llama_expert_manager_ffi *,
+        int32_t,
+        const char *) {
+    return -1;
+}
+
+__attribute__((weak)) void llama_expert_manager_free(llama_expert_manager_ffi *) {
+}
+
+__attribute__((weak)) const char * llama_expert_manager_last_error_message() {
+    return nullptr;
+}
+
+__attribute__((weak)) int32_t llama_expert_manager_stats(
+        llama_expert_manager_ffi *,
+        size_t *,
+        size_t *) {
+    return -1;
+}
+
+}
+#endif
+
+namespace {
+
+struct llama_moe_tensor_meta {
+    ExpertManager * manager = nullptr;
+    int32_t layer = -1;
+    MoePart part = MoePart::Up;
+};
+
+struct llama_moe_expert_op_handle {
+    MoePart part = MoePart::Up;
+    std::unordered_map<int32_t, ExpertHandle> handles;
+};
+
+std::mutex & llama_moe_registry_mutex() {
+    static std::mutex mu;
+    return mu;
+}
+
+std::unordered_map<const ggml_tensor *, llama_moe_tensor_meta> & llama_moe_registry() {
+    static std::unordered_map<const ggml_tensor *, llama_moe_tensor_meta> registry;
+    return registry;
+}
+
+void * llama_moe_expert_ensure_callback(void *, const ggml_tensor * src0, const ggml_tensor * ids) {
+    llama_moe_tensor_meta meta;
+    {
+        std::lock_guard<std::mutex> lock(llama_moe_registry_mutex());
+        auto it = llama_moe_registry().find(src0);
+        if (it == llama_moe_registry().end()) {
+            return nullptr;
+        }
+        meta = it->second;
+    }
+
+    std::vector<ExpertKey> experts;
+    experts.reserve(static_cast<size_t>(ids->ne[0] * ids->ne[1]));
+
+    for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+        for (int64_t id = 0; id < ids->ne[0]; ++id) {
+            const int32_t expert =
+                *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+            experts.push_back({ meta.layer, expert });
+        }
+    }
+
+    try {
+        return new llama_moe_expert_op_handle {
+            meta.part,
+            meta.manager->ensure_map(std::move(experts)),
+        };
+    } catch (const std::exception & e) {
+        GGML_ABORT("MoE expert ensure failed: %s", e.what());
+    } catch (...) {
+        GGML_ABORT("MoE expert ensure failed");
+    }
+}
+
+const void * llama_moe_expert_get_data_callback(void *, void * handle, int32_t expert, const void * fallback) {
+    auto * op_handle = static_cast<llama_moe_expert_op_handle *>(handle);
+    if (op_handle == nullptr) {
+        return fallback;
+    }
+
+    auto it = op_handle->handles.find(expert);
+    if (it == op_handle->handles.end()) {
+        GGML_ABORT("MoE expert %d was not ensured before data lookup", expert);
+    }
+
+    uint8_t * ptr = it->second.host_ptr(op_handle->part);
+    if (ptr == nullptr) {
+        GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(op_handle->part));
+    }
+
+    return ptr;
+}
+
+void llama_moe_expert_release_callback(void *, void * handle) {
+    delete static_cast<llama_moe_expert_op_handle *>(handle);
+}
+
+void llama_moe_expert_install_callback() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        ggml_moe_expert_set_callback(
+                llama_moe_expert_ensure_callback,
+                llama_moe_expert_get_data_callback,
+                llama_moe_expert_release_callback,
+                nullptr);
+    });
+}
+
+} // namespace
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
@@ -680,9 +869,21 @@ struct llama_model::impl {
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+    if (params.expert_manager != nullptr) {
+        expert_manager = std::make_unique<ExpertManager>(
+                static_cast<llama_expert_manager_ffi *>(params.expert_manager),
+                params.expert_manager_owned);
+        llama_moe_expert_install_callback();
+    }
 }
 
 llama_model::~llama_model() {
+    if (!expert_manager_tensors.empty()) {
+        std::lock_guard<std::mutex> lock(llama_moe_registry_mutex());
+        for (const ggml_tensor * tensor : expert_manager_tensors) {
+            llama_moe_registry().erase(tensor);
+        }
+    }
     for (auto * lora : loras) {
         delete lora;
     }
@@ -2998,8 +3199,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
+    const bool expert_cache_requested = expert_manager != nullptr || params.expert_cache_capacity > 0;
+
     // build a list of buffer types for the CPU and GPU devices
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    const bool use_cpu_extra_bufts = params.use_extra_bufts && !expert_cache_requested;
+    if (expert_cache_requested && params.use_extra_bufts) {
+        LLAMA_LOG_INFO("%s: disabling CPU extra buffer types for MoE expert cache; cached experts use raw GGUF tensor layout\n", __func__);
+    }
+    pimpl->cpu_buft_list = make_cpu_buft_list(devices, use_cpu_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -7921,13 +8128,138 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     ml.done_getting_tensors();
 
     // populate tensors_by_name
+    std::unordered_map<const ggml_tensor *, ggml_backend_buffer_type_t> tensor_buft_map;
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+            tensor_buft_map[cur] = _;
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    auto has_gguf_weight = [&](ggml_tensor * tensor) {
+        return tensor != nullptr && ml.weights_map.find(ggml_get_name(tensor)) != ml.weights_map.end();
+    };
+
+    auto is_cpu_tensor = [&](ggml_tensor * tensor) {
+        auto it = tensor_buft_map.find(tensor);
+        if (it == tensor_buft_map.end()) {
+            return false;
+        }
+
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(it->second);
+        if (dev == nullptr) {
+            // CPU backend buffer type may not report a device.
+            return it->second == ggml_backend_cpu_buffer_type();
+        }
+        return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    };
+
+    auto is_cpu_overridden_tensor = [&](ggml_tensor * tensor) {
+        if (tensor == nullptr || params.tensor_buft_overrides == nullptr) {
+            return false;
+        }
+
+        const std::string tensor_name = ggml_get_name(tensor);
+        for (const auto * overrides = params.tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
+            if (overrides->buft == ggml_backend_cpu_buffer_type() && std::regex_search(tensor_name, std::regex(overrides->pattern))) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto is_cpu_moe_tensor = [&](ggml_tensor * tensor) {
+        return has_gguf_weight(tensor) && (is_cpu_tensor(tensor) || is_cpu_overridden_tensor(tensor));
+    };
+
+    if (!expert_manager && params.expert_cache_capacity > 0) {
+        if (hparams.n_expert == 0 || hparams.n_ff_exp == 0) {
+            LLAMA_LOG_WARN("%s: expert cache capacity was set, but this model has no routed MoE experts; ignoring expert cache\n", __func__);
+        } else {
+            size_t slot_size = 0;
+            size_t registered_tensor_count = 0;
+
+            auto add_tensor_slot_size = [&](ggml_tensor * tensor, size_t & layer_slot_size) {
+                if (!is_cpu_moe_tensor(tensor)) {
+                    return;
+                }
+                if (tensor->ne[2] <= 0 || tensor->nb[2] == 0) {
+                    return;
+                }
+                layer_slot_size += tensor->nb[2];
+                registered_tensor_count++;
+            };
+
+            for (int il = 0; il < static_cast<int>(layers.size()); ++il) {
+                llama_layer & layer = layers[il];
+                size_t layer_slot_size = 0;
+                add_tensor_slot_size(layer.ffn_up_exps,      layer_slot_size);
+                add_tensor_slot_size(layer.ffn_gate_exps,    layer_slot_size);
+                add_tensor_slot_size(layer.ffn_down_exps,    layer_slot_size);
+                add_tensor_slot_size(layer.ffn_gate_up_exps, layer_slot_size);
+                slot_size = std::max(slot_size, layer_slot_size);
+            }
+
+            if (slot_size == 0) {
+                LLAMA_LOG_WARN("%s: expert cache capacity was set, but no CPU MoE expert tensors were found; ignoring expert cache\n", __func__);
+            } else {
+                expert_manager = std::make_unique<ExpertManager>(ExpertManager::create_with_slot_size(
+                        params.expert_cache_capacity,
+                        slot_size));
+                llama_moe_expert_install_callback();
+                LLAMA_LOG_INFO(
+                        "%s: auto-created MoE expert cache: capacity=%zu, slot_size=%.2f MiB, total_cache=%.2f MiB, registered_moe_tensors=%zu\n",
+                        __func__,
+                        params.expert_cache_capacity,
+                        slot_size / 1048576.0,
+                        (params.expert_cache_capacity * slot_size) / 1048576.0,
+                        registered_tensor_count);
+            }
+        }
+    }
+
+    if (expert_manager) {
+        size_t skipped_tensor_count = 0;
+        size_t skipped_bytes = 0;
+
+        auto mark_skip_load = [&](ggml_tensor * tensor) {
+            if (tensor == nullptr) {
+                return;
+            }
+            if (!has_gguf_weight(tensor)) {
+                return;
+            }
+            if (!is_cpu_moe_tensor(tensor)) {
+                LLAMA_LOG_WARN("%s: MoE expert cache is currently wired only for CPU MUL_MAT_ID; loading GPU tensor '%s' normally\n",
+                        __func__, ggml_get_name(tensor));
+                return;
+            }
+            tensor->flags |= GGML_TENSOR_FLAG_EXTERNAL;
+            ml.skip_load_tensors.insert(ggml_get_name(tensor));
+            skipped_tensor_count++;
+            skipped_bytes += ggml_nbytes(tensor);
+        };
+
+        for (int il = 0; il < static_cast<int>(layers.size()); ++il) {
+            llama_layer & layer = layers[il];
+            mark_skip_load(layer.ffn_up_exps);
+            mark_skip_load(layer.ffn_gate_exps);
+            mark_skip_load(layer.ffn_down_exps);
+            mark_skip_load(layer.ffn_gate_up_exps);
+        }
+
+        LLAMA_LOG_INFO(
+                "%s: MoE expert cache externalized %zu tensor(s), skipped %.2f MiB from llama weight buffers\n",
+                __func__,
+                skipped_tensor_count,
+                skipped_bytes / 1048576.0);
+    }
+
+    const bool mmap_prefetch = expert_manager == nullptr;
+    if (expert_manager && ml.use_mmap) {
+        LLAMA_LOG_INFO("%s: keeping mmap for non-expert tensors; disabling full-file mmap prefetch for expert cache\n", __func__);
+    }
+    ml.init_mappings(mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -8053,6 +8385,64 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+
+    if (expert_manager) {
+        if (ml.file_paths.empty()) {
+            throw std::runtime_error("MoE expert cache requires path-backed GGUF files");
+        }
+        for (size_t file_id = 0; file_id < ml.file_paths.size(); ++file_id) {
+            expert_manager->register_file(static_cast<int32_t>(file_id), ml.file_paths[file_id]);
+        }
+
+        auto register_moe_tensor = [&](ggml_tensor * tensor, int32_t layer, MoePart part) {
+            if (tensor == nullptr) {
+                return;
+            }
+            const std::string name = ggml_get_name(tensor);
+            auto weight = ml.weights_map.find(name);
+            if (weight == ml.weights_map.end()) {
+                return;
+            }
+            if (!is_cpu_moe_tensor(tensor)) {
+                return;
+            }
+            if (tensor->ne[2] <= 0 || tensor->nb[2] == 0) {
+                throw std::runtime_error(format("invalid MoE expert tensor layout for '%s'", ggml_get_name(tensor)));
+            }
+
+            const int32_t file_id = weight->second.idx;
+            const uint64_t tensor_file_offset = weight->second.offs;
+            const size_t expert_stride = tensor->nb[2];
+            const int64_t n_expert = tensor->ne[2];
+
+            if (expert_stride * static_cast<size_t>(n_expert) > ggml_nbytes(tensor)) {
+                throw std::runtime_error(format("MoE expert tensor '%s' has unsupported non-contiguous expert layout", name.c_str()));
+            }
+
+            for (int64_t expert = 0; expert < n_expert; ++expert) {
+                ExpertSlice slice = make_expert_slice(
+                        part,
+                        file_id,
+                        tensor_file_offset + static_cast<uint64_t>(expert_stride * expert),
+                        expert_stride);
+                expert_manager->register_slice(layer, static_cast<int32_t>(expert), slice);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(llama_moe_registry_mutex());
+                llama_moe_registry()[tensor] = { expert_manager.get(), layer, part };
+            }
+            expert_manager_tensors.push_back(tensor);
+        };
+
+        for (int32_t il = 0; il < static_cast<int32_t>(layers.size()); ++il) {
+            llama_layer & layer = layers[il];
+            register_moe_tensor(layer.ffn_up_exps,      il, MoePart::Up);
+            register_moe_tensor(layer.ffn_gate_exps,    il, MoePart::Gate);
+            register_moe_tensor(layer.ffn_down_exps,    il, MoePart::Down);
+            register_moe_tensor(layer.ffn_gate_up_exps, il, MoePart::GateUp);
         }
     }
 
@@ -9104,6 +9494,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.expert_manager              =*/ nullptr,
+        /*.expert_cache_capacity       =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,
@@ -9112,6 +9504,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.expert_manager_owned        =*/ false,
     };
 
     return result;
