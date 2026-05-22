@@ -54,6 +54,7 @@ extern "C" {
 
 struct llama_expert_manager_ffi;
 struct llama_expert_handle_ffi;
+struct llama_expert_ticket_ffi;
 
 struct llama_expert_slice_ffi {
     int32_t part;
@@ -85,6 +86,33 @@ int32_t llama_expert_manager_ensure_many(
         const int32_t * experts,
         size_t count,
         llama_expert_handle_ffi ** handles_out);
+
+llama_expert_ticket_ffi * llama_expert_manager_submit_batch_async(
+        llama_expert_manager_ffi * manager,
+        int32_t layer,
+        const int32_t * experts,
+        size_t count);
+
+llama_expert_handle_ffi * llama_expert_ticket_get_handle(
+        const llama_expert_ticket_ffi * ticket,
+        int32_t layer,
+        int32_t expert);
+
+llama_expert_handle_ffi * llama_expert_ticket_try_get_handle(
+        const llama_expert_ticket_ffi * ticket,
+        int32_t layer,
+        int32_t expert);
+
+llama_expert_handle_ffi * llama_expert_ticket_wait_any_ready(
+        const llama_expert_ticket_ffi * ticket,
+        int32_t layer,
+        const int32_t * experts,
+        size_t count,
+        int32_t * expert_out);
+
+void llama_expert_ticket_release(llama_expert_ticket_ffi * ticket);
+
+void llama_expert_ticket_free(llama_expert_ticket_ffi * ticket);
 
 void llama_expert_manager_release(
         llama_expert_manager_ffi * manager,
@@ -137,6 +165,57 @@ inline llama_expert_slice_ffi to_ffi(const ExpertSlice & slice) {
 }
 
 class ExpertManager;
+class ExpertHandle;
+
+class ExpertTicket {
+public:
+    ExpertTicket() = default;
+
+    ExpertTicket(ExpertManager * manager, llama_expert_ticket_ffi * ticket)
+        : manager_(manager), ticket_(ticket) {}
+
+    ExpertTicket(const ExpertTicket &) = delete;
+    ExpertTicket & operator=(const ExpertTicket &) = delete;
+
+    ExpertTicket(ExpertTicket && other) noexcept {
+        manager_ = other.manager_;
+        ticket_ = other.ticket_;
+        other.manager_ = nullptr;
+        other.ticket_ = nullptr;
+    }
+
+    ExpertTicket & operator=(ExpertTicket && other) noexcept {
+        if (this != &other) {
+            reset();
+            manager_ = other.manager_;
+            ticket_ = other.ticket_;
+            other.manager_ = nullptr;
+            other.ticket_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~ExpertTicket() {
+        reset();
+    }
+
+    explicit operator bool() const {
+        return ticket_ != nullptr;
+    }
+
+    ExpertHandle get_handle(int32_t layer, int32_t expert) const;
+    ExpertHandle try_get_handle(int32_t layer, int32_t expert) const;
+    std::pair<int32_t, ExpertHandle> wait_any_ready(int32_t layer, const int32_t * experts, size_t count) const;
+
+    void release();
+    void reset();
+
+private:
+    ExpertManager * manager_ = nullptr;
+    llama_expert_ticket_ffi * ticket_ = nullptr;
+
+    friend class ExpertManager;
+};
 
 class ExpertHandle {
 public:
@@ -329,6 +408,40 @@ public:
         return handles;
     }
 
+    ExpertTicket submit_batch_async(std::vector<ExpertKey> experts) {
+        std::sort(experts.begin(), experts.end());
+        experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
+
+        if (experts.empty()) {
+            return ExpertTicket(this, nullptr);
+        }
+
+        const int32_t layer = experts.front().layer;
+        std::vector<int32_t> expert_ids;
+        expert_ids.reserve(experts.size());
+        for (const ExpertKey & key : experts) {
+            if (key.layer != layer) {
+                throw std::runtime_error("failed to batch submit MoE experts from multiple layers");
+            }
+            expert_ids.push_back(key.expert);
+        }
+
+        llama_expert_ticket_ffi * ticket = llama_expert_manager_submit_batch_async(
+                impl_,
+                layer,
+                expert_ids.data(),
+                expert_ids.size());
+        if (ticket == nullptr) {
+            const char * err = llama_expert_manager_last_error_message();
+            if (err != nullptr && err[0] != '\0') {
+                throw std::runtime_error(std::string("failed to submit MoE expert batch: ") + err);
+            }
+            throw std::runtime_error("failed to submit MoE expert batch");
+        }
+
+        return ExpertTicket(this, ticket);
+    }
+
     void register_slice(int32_t layer, int32_t expert, const ExpertSlice & slice) {
         llama_expert_slice_ffi ffi_slice = to_ffi(slice);
         const int32_t rc = llama_expert_manager_register_slice(impl_, layer, expert, &ffi_slice);
@@ -347,6 +460,58 @@ public:
     void release(llama_expert_handle_ffi * handle) {
         if (handle != nullptr) {
             llama_expert_manager_release(impl_, handle);
+        }
+    }
+
+    ExpertHandle ticket_get_handle(const ExpertTicket & ticket, int32_t layer, int32_t expert) {
+        (void) ticket;
+        llama_expert_handle_ffi * handle = llama_expert_ticket_get_handle(ticket.ticket_, layer, expert);
+        if (handle == nullptr) {
+            const char * err = llama_expert_manager_last_error_message();
+            if (err != nullptr && err[0] != '\0') {
+                throw std::runtime_error(std::string("failed to get MoE expert handle from ticket: ") + err);
+            }
+            throw std::runtime_error("failed to get MoE expert handle from ticket");
+        }
+        return ExpertHandle(this, handle);
+    }
+
+    ExpertHandle ticket_try_get_handle(const ExpertTicket & ticket, int32_t layer, int32_t expert) {
+        (void) ticket;
+        llama_expert_handle_ffi * handle = llama_expert_ticket_try_get_handle(ticket.ticket_, layer, expert);
+        if (handle == nullptr) {
+            return ExpertHandle();
+        }
+        return ExpertHandle(this, handle);
+    }
+
+    std::pair<int32_t, ExpertHandle> ticket_wait_any_ready(
+            const ExpertTicket & ticket,
+            int32_t layer,
+            const int32_t * experts,
+            size_t count) {
+        (void) ticket;
+        int32_t ready_expert = -1;
+        llama_expert_handle_ffi * handle = llama_expert_ticket_wait_any_ready(
+                ticket.ticket_,
+                layer,
+                experts,
+                count,
+                &ready_expert);
+        if (handle == nullptr) {
+            const char * err = llama_expert_manager_last_error_message();
+            if (err != nullptr && err[0] != '\0') {
+                throw std::runtime_error(std::string("failed to wait for ready MoE expert from ticket: ") + err);
+            }
+            throw std::runtime_error("failed to wait for ready MoE expert from ticket");
+        }
+        return { ready_expert, ExpertHandle(this, handle) };
+    }
+
+    void release_ticket(llama_expert_ticket_ffi * ticket) {
+        if (ticket != nullptr) {
+            llama_expert_ticket_release(ticket);
+            llama_expert_ticket_free(ticket);
         }
     }
 
@@ -370,6 +535,8 @@ private:
 
     llama_expert_manager_ffi * impl_ = nullptr;
     bool owns_impl_ = false;
+
+    friend class ExpertTicket;
 };
 
 inline void ExpertHandle::reset() {
@@ -378,4 +545,42 @@ inline void ExpertHandle::reset() {
     }
     manager_ = nullptr;
     handle_ = nullptr;
+}
+
+inline ExpertHandle ExpertTicket::get_handle(int32_t layer, int32_t expert) const {
+    if (manager_ == nullptr || ticket_ == nullptr) {
+        throw std::runtime_error("MoE expert ticket is not valid");
+    }
+    return manager_->ticket_get_handle(*this, layer, expert);
+}
+
+inline ExpertHandle ExpertTicket::try_get_handle(int32_t layer, int32_t expert) const {
+    if (manager_ == nullptr || ticket_ == nullptr) {
+        return ExpertHandle();
+    }
+    return manager_->ticket_try_get_handle(*this, layer, expert);
+}
+
+inline std::pair<int32_t, ExpertHandle> ExpertTicket::wait_any_ready(
+        int32_t layer,
+        const int32_t * experts,
+        size_t count) const {
+    if (manager_ == nullptr || ticket_ == nullptr) {
+        throw std::runtime_error("MoE expert ticket is not valid");
+    }
+    return manager_->ticket_wait_any_ready(*this, layer, experts, count);
+}
+
+inline void ExpertTicket::release() {
+    if (ticket_ != nullptr) {
+        llama_expert_ticket_release(ticket_);
+    }
+}
+
+inline void ExpertTicket::reset() {
+    if (manager_ != nullptr && ticket_ != nullptr) {
+        manager_->release_ticket(ticket_);
+    }
+    manager_ = nullptr;
+    ticket_ = nullptr;
 }

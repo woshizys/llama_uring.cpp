@@ -2229,6 +2229,20 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * glu,
                                           const ggml_tensor * ffn_up_bias = nullptr,
                                           const ggml_tensor * ffn_gate_bias = nullptr) {
+    if (ffn_up == nullptr || ffn_gate == nullptr || glu == nullptr) {
+        return false;
+    }
+    if (ffn_up->src[0] == nullptr || ffn_gate->src[0] == nullptr ||
+        ffn_up->src[1] == nullptr || ffn_gate->src[1] == nullptr) {
+        return false;
+    }
+    if ((ffn_up->src[0]->flags & GGML_TENSOR_FLAG_EXTERNAL) ||
+        (ffn_gate->src[0]->flags & GGML_TENSOR_FLAG_EXTERNAL) ||
+        ffn_up->src[0]->buffer == nullptr ||
+        ffn_gate->src[0]->buffer == nullptr) {
+        return false;
+    }
+
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
 
     if (has_bias && (!ffn_up_bias || !ffn_gate_bias)) {
@@ -2237,8 +2251,6 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 
     const bool is_mul_mat     = ffn_up->op == GGML_OP_MUL_MAT     && ffn_gate->op == GGML_OP_MUL_MAT     && glu->op == GGML_OP_GLU;
     const bool is_mul_mat_id  = ffn_up->op == GGML_OP_MUL_MAT_ID  && ffn_gate->op == GGML_OP_MUL_MAT_ID  && glu->op == GGML_OP_GLU;
-
-    GGML_ASSERT(ffn_up && ffn_gate && glu);
 
     if (!is_mul_mat && !is_mul_mat_id) {
         return false;
@@ -4867,6 +4879,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (a == nullptr || b == nullptr) {
+                    return false;
+                }
+                if (op->op == GGML_OP_MUL_MAT_ID &&
+                    ((a->flags & GGML_TENSOR_FLAG_EXTERNAL) || a->buffer == nullptr)) {
+                    return false;
+                }
                 if (a->buffer && ggml_backend_buft_is_cuda_split(a->buffer->buft)) {
                     if (a->ne[2] > 1 || a->ne[3] > 1) {
                         return false;
@@ -5202,6 +5221,12 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    if (op->op == GGML_OP_MUL_MAT_ID &&
+        op->src[0] != nullptr &&
+        ((op->src[0]->flags & GGML_TENSOR_FLAG_EXTERNAL) || op->src[0]->buffer == nullptr)) {
+        return false;
+    }
 
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }

@@ -1,15 +1,16 @@
 //! Rust FFI surface connecting llama.cpp MoE expert cache calls to io-scheduler.
 
 use io_scheduler::expert_manager::{
-    ExpertHandle as SchedulerExpertHandle, ExpertKey, LlamaExpertManager, MoePart, Slice,
-    TensorMeta,
+    ExpertHandle as SchedulerExpertHandle, ExpertKey, ExpertTicket as SchedulerExpertTicket,
+    LlamaExpertManager, MoePart, Slice, TensorMeta,
 };
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use tokio::runtime::{Builder, Runtime};
+use std::sync::Arc;
+use tokio::runtime::{Builder, Handle, Runtime};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -28,9 +29,11 @@ pub enum ExpertCacheError {
     IntegerOverflow(&'static str, u64),
     NullManager,
     NullHandle,
+    NullTicket,
     NullSlice,
     NullPath,
     NullExperts,
+    NullExpertOut,
     NullHandles,
     Backend(String),
     Panic,
@@ -47,9 +50,11 @@ impl std::fmt::Display for ExpertCacheError {
             }
             Self::NullManager => write!(f, "null expert manager pointer"),
             Self::NullHandle => write!(f, "null expert handle pointer"),
+            Self::NullTicket => write!(f, "null expert ticket pointer"),
             Self::NullSlice => write!(f, "null expert slice pointer"),
             Self::NullPath => write!(f, "null expert file path pointer"),
             Self::NullExperts => write!(f, "null expert ids pointer"),
+            Self::NullExpertOut => write!(f, "null output expert pointer"),
             Self::NullHandles => write!(f, "null output handles pointer"),
             Self::Backend(msg) => write!(f, "{msg}"),
             Self::Panic => write!(f, "panic crossed FFI boundary"),
@@ -110,7 +115,18 @@ impl llama_expert_manager_ffi {
 
 #[allow(non_camel_case_types)]
 pub struct llama_expert_handle_ffi {
-    handle: SchedulerExpertHandle,
+    handle: ExpertHandleStorage,
+}
+
+enum ExpertHandleStorage {
+    Owned(SchedulerExpertHandle),
+    Shared(Arc<SchedulerExpertHandle>),
+}
+
+#[allow(non_camel_case_types)]
+pub struct llama_expert_ticket_ffi {
+    ticket: SchedulerExpertTicket,
+    runtime: Handle,
 }
 
 thread_local! {
@@ -137,13 +153,40 @@ fn manager_mut<'a>(
 }
 
 fn handle_from_scheduler(handle: SchedulerExpertHandle) -> *mut llama_expert_handle_ffi {
-    Box::into_raw(Box::new(llama_expert_handle_ffi { handle }))
+    Box::into_raw(Box::new(llama_expert_handle_ffi {
+        handle: ExpertHandleStorage::Owned(handle),
+    }))
+}
+
+fn handle_from_shared(handle: Arc<SchedulerExpertHandle>) -> *mut llama_expert_handle_ffi {
+    Box::into_raw(Box::new(llama_expert_handle_ffi {
+        handle: ExpertHandleStorage::Shared(handle),
+    }))
 }
 
 fn handle_ref<'a>(
     handle: *const llama_expert_handle_ffi,
 ) -> Result<&'a llama_expert_handle_ffi, ExpertCacheError> {
     unsafe { handle.as_ref() }.ok_or(ExpertCacheError::NullHandle)
+}
+
+fn scheduler_handle_ref<'a>(handle: &'a llama_expert_handle_ffi) -> &'a SchedulerExpertHandle {
+    match &handle.handle {
+        ExpertHandleStorage::Owned(handle) => handle,
+        ExpertHandleStorage::Shared(handle) => handle.as_ref(),
+    }
+}
+
+fn ticket_ref<'a>(
+    ticket: *const llama_expert_ticket_ffi,
+) -> Result<&'a llama_expert_ticket_ffi, ExpertCacheError> {
+    unsafe { ticket.as_ref() }.ok_or(ExpertCacheError::NullTicket)
+}
+
+fn ticket_mut<'a>(
+    ticket: *mut llama_expert_ticket_ffi,
+) -> Result<&'a mut llama_expert_ticket_ffi, ExpertCacheError> {
+    unsafe { ticket.as_mut() }.ok_or(ExpertCacheError::NullTicket)
 }
 
 fn path_from_ptr<'a>(path: *const c_char) -> Result<&'a str, ExpertCacheError> {
@@ -388,7 +431,11 @@ pub extern "C" fn llama_expert_manager_ensure_many(
         }
 
         let layer = id_to_usize("layer", layer)?;
-        let expert_ids = unsafe { std::slice::from_raw_parts(experts, count) };
+        let expert_ids = if count == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(experts, count) }
+        };
         let keys = expert_ids
             .iter()
             .copied()
@@ -418,6 +465,226 @@ pub extern "C" fn llama_expert_manager_ensure_many(
             set_last_error(ExpertCacheError::Panic);
             -2
         }
+    }
+}
+
+/// Submits a batch of experts from the same layer for asynchronous loading.
+///
+/// Returns null on failure; call `llama_expert_manager_last_error_message()`.
+/// The returned ticket must be released/freed with `llama_expert_ticket_release`
+/// and `llama_expert_ticket_free`.
+#[no_mangle]
+pub extern "C" fn llama_expert_manager_submit_batch_async(
+    manager: *mut llama_expert_manager_ffi,
+    layer: i32,
+    experts: *const i32,
+    count: usize,
+) -> *mut llama_expert_ticket_ffi {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let manager = manager_mut(manager)?;
+        if count > 0 && experts.is_null() {
+            return Err(ExpertCacheError::NullExperts);
+        }
+
+        let layer = id_to_usize("layer", layer)?;
+        let expert_ids = if count == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(experts, count) }
+        };
+        let keys = expert_ids
+            .iter()
+            .copied()
+            .map(|expert| Ok(ExpertKey::new(layer, id_to_usize("expert", expert)?)))
+            .collect::<Result<Vec<_>, ExpertCacheError>>()?;
+
+        let ticket = manager
+            .runtime
+            .block_on(manager.manager.submit_batch_async(keys))
+            .map_err(scheduler_error)?;
+
+        Ok(llama_expert_ticket_ffi {
+            ticket,
+            runtime: manager.runtime.handle().clone(),
+        })
+    }));
+
+    match result {
+        Ok(Ok(ticket)) => Box::into_raw(Box::new(ticket)),
+        Ok(Err(error)) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_last_error(ExpertCacheError::Panic);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Gets one pinned expert handle from a ticket, blocking until it is loaded.
+///
+/// Returns null on failure; call `llama_expert_manager_last_error_message()`.
+/// The returned handle must be released exactly once with
+/// `llama_expert_manager_release`.
+#[no_mangle]
+pub extern "C" fn llama_expert_ticket_get_handle(
+    ticket: *const llama_expert_ticket_ffi,
+    layer: i32,
+    expert: i32,
+) -> *mut llama_expert_handle_ffi {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let ticket = ticket_ref(ticket)?;
+        let key = ExpertKey::new(id_to_usize("layer", layer)?, id_to_usize("expert", expert)?);
+        ticket
+            .runtime
+            .block_on(ticket.ticket.get_handle(&key))
+            .map(handle_from_shared)
+            .map_err(scheduler_error)
+    }));
+
+    match result {
+        Ok(Ok(handle)) => handle,
+        Ok(Err(error)) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_last_error(ExpertCacheError::Panic);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Returns one pinned handle if the expert is already ready in the ticket.
+///
+/// Returns null when the expert is not ready or on failure. On failure,
+/// `llama_expert_manager_last_error_message()` is set.
+#[no_mangle]
+pub extern "C" fn llama_expert_ticket_try_get_handle(
+    ticket: *const llama_expert_ticket_ffi,
+    layer: i32,
+    expert: i32,
+) -> *mut llama_expert_handle_ffi {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let ticket = ticket_ref(ticket)?;
+        let key = ExpertKey::new(id_to_usize("layer", layer)?, id_to_usize("expert", expert)?);
+        Ok(ticket.runtime.block_on(ticket.ticket.try_get_handle(&key)))
+    }));
+
+    match result {
+        Ok(Ok(Some(handle))) => handle_from_shared(handle),
+        Ok(Ok(None)) => ptr::null_mut(),
+        Ok(Err(error)) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_last_error(ExpertCacheError::Panic);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Waits until any expert in `experts` is ready and returns its pinned handle.
+///
+/// The chosen expert id is written to `expert_out`. Returns null on failure;
+/// call `llama_expert_manager_last_error_message()`.
+#[no_mangle]
+pub extern "C" fn llama_expert_ticket_wait_any_ready(
+    ticket: *const llama_expert_ticket_ffi,
+    layer: i32,
+    experts: *const i32,
+    count: usize,
+    expert_out: *mut i32,
+) -> *mut llama_expert_handle_ffi {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let ticket = ticket_ref(ticket)?;
+        if count > 0 && experts.is_null() {
+            return Err(ExpertCacheError::NullExperts);
+        }
+        if expert_out.is_null() {
+            return Err(ExpertCacheError::NullExpertOut);
+        }
+
+        let layer = id_to_usize("layer", layer)?;
+        let expert_ids = unsafe { std::slice::from_raw_parts(experts, count) };
+        let keys = expert_ids
+            .iter()
+            .copied()
+            .map(|expert| Ok(ExpertKey::new(layer, id_to_usize("expert", expert)?)))
+            .collect::<Result<Vec<_>, ExpertCacheError>>()?;
+
+        let (key, handle) = ticket
+            .runtime
+            .block_on(ticket.ticket.wait_any_ready(&keys))
+            .map_err(scheduler_error)?;
+        let expert = i32::try_from(key.expert()).map_err(|_| {
+            ExpertCacheError::Backend("ready expert id does not fit i32".to_string())
+        })?;
+        unsafe {
+            *expert_out = expert;
+        }
+        Ok(handle_from_shared(handle))
+    }));
+
+    match result {
+        Ok(Ok(handle)) => handle,
+        Ok(Err(error)) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_last_error(ExpertCacheError::Panic);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Releases all handles pinned by a ticket. Handles already returned to C remain
+/// pinned until individually released.
+#[no_mangle]
+pub extern "C" fn llama_expert_ticket_release(ticket: *mut llama_expert_ticket_ffi) {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), ExpertCacheError> {
+        let ticket = ticket_mut(ticket)?;
+        ticket.runtime.block_on(ticket.ticket.release());
+        Ok(())
+    }));
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => set_last_error(error),
+        Err(_) => set_last_error(ExpertCacheError::Panic),
+    }
+}
+
+/// Frees an expert ticket created by Rust.
+#[no_mangle]
+pub extern "C" fn llama_expert_ticket_free(ticket: *mut llama_expert_ticket_ffi) {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), ExpertCacheError> {
+        if ticket.is_null() {
+            return Ok(());
+        }
+        let _drop_ticket = unsafe { Box::from_raw(ticket) };
+        Ok(())
+    }));
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => set_last_error(error),
+        Err(_) => set_last_error(ExpertCacheError::Panic),
     }
 }
 
@@ -464,8 +731,7 @@ pub extern "C" fn llama_expert_handle_host_ptr(
     let result = catch_unwind(AssertUnwindSafe(|| {
         let handle = handle_ref(handle)?;
         let part = part_from_i32(part)?;
-        Ok(handle
-            .handle
+        Ok(scheduler_handle_ref(handle)
             .get_part(part)
             .map_err(scheduler_error)?
             .host_ptr as *mut u8)
@@ -494,8 +760,7 @@ pub extern "C" fn llama_expert_handle_device_ptr(
     let result = catch_unwind(AssertUnwindSafe(|| {
         let handle = handle_ref(handle)?;
         let part = part_from_i32(part)?;
-        Ok(handle
-            .handle
+        Ok(scheduler_handle_ref(handle)
             .get_part(part)
             .map_err(scheduler_error)?
             .device_ptr)
@@ -524,8 +789,7 @@ pub extern "C" fn llama_expert_handle_part_size(
     let result = catch_unwind(AssertUnwindSafe(|| {
         let handle = handle_ref(handle)?;
         let part = part_from_i32(part)?;
-        Ok(handle
-            .handle
+        Ok(scheduler_handle_ref(handle)
             .get_part(part)
             .map_err(scheduler_error)?
             .data_size)
@@ -550,7 +814,7 @@ pub extern "C" fn llama_expert_handle_slot_id(handle: *const llama_expert_handle
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         let handle = handle_ref(handle)?;
-        i32::try_from(handle.handle.slot_id())
+        i32::try_from(scheduler_handle_ref(handle).slot_id())
             .map_err(|_| ExpertCacheError::Backend("expert slot id does not fit i32".to_string()))
     }));
 

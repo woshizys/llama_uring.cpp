@@ -70,6 +70,43 @@ __attribute__((weak)) int32_t llama_expert_manager_ensure_many(
     return -1;
 }
 
+__attribute__((weak)) llama_expert_ticket_ffi * llama_expert_manager_submit_batch_async(
+        llama_expert_manager_ffi *,
+        int32_t,
+        const int32_t *,
+        size_t) {
+    return nullptr;
+}
+
+__attribute__((weak)) llama_expert_handle_ffi * llama_expert_ticket_get_handle(
+        const llama_expert_ticket_ffi *,
+        int32_t,
+        int32_t) {
+    return nullptr;
+}
+
+__attribute__((weak)) llama_expert_handle_ffi * llama_expert_ticket_try_get_handle(
+        const llama_expert_ticket_ffi *,
+        int32_t,
+        int32_t) {
+    return nullptr;
+}
+
+__attribute__((weak)) llama_expert_handle_ffi * llama_expert_ticket_wait_any_ready(
+        const llama_expert_ticket_ffi *,
+        int32_t,
+        const int32_t *,
+        size_t,
+        int32_t *) {
+    return nullptr;
+}
+
+__attribute__((weak)) void llama_expert_ticket_release(llama_expert_ticket_ffi *) {
+}
+
+__attribute__((weak)) void llama_expert_ticket_free(llama_expert_ticket_ffi *) {
+}
+
 __attribute__((weak)) void llama_expert_manager_release(
         llama_expert_manager_ffi *,
         llama_expert_handle_ffi *) {
@@ -140,7 +177,13 @@ struct llama_moe_tensor_meta {
 
 struct llama_moe_expert_op_handle {
     MoePart part = MoePart::Up;
+    int32_t layer = -1;
+    ExpertTicket ticket;
     std::unordered_map<int32_t, ExpertHandle> handles;
+    std::mutex mutex;
+
+    llama_moe_expert_op_handle(MoePart part, int32_t layer, ExpertTicket ticket)
+        : part(part), layer(layer), ticket(std::move(ticket)) {}
 };
 
 std::mutex & llama_moe_registry_mutex() {
@@ -176,10 +219,10 @@ void * llama_moe_expert_ensure_callback(void *, const ggml_tensor * src0, const 
     }
 
     try {
-        return new llama_moe_expert_op_handle {
-            meta.part,
-            meta.manager->ensure_map(std::move(experts)),
-        };
+        return new llama_moe_expert_op_handle(
+                meta.part,
+                meta.layer,
+                meta.manager->submit_batch_async(std::move(experts)));
     } catch (const std::exception & e) {
         GGML_ABORT("MoE expert ensure failed: %s", e.what());
     } catch (...) {
@@ -193,17 +236,95 @@ const void * llama_moe_expert_get_data_callback(void *, void * handle, int32_t e
         return fallback;
     }
 
-    auto it = op_handle->handles.find(expert);
-    if (it == op_handle->handles.end()) {
-        GGML_ABORT("MoE expert %d was not ensured before data lookup", expert);
+    {
+        std::lock_guard<std::mutex> lock(op_handle->mutex);
+        auto it = op_handle->handles.find(expert);
+        if (it != op_handle->handles.end()) {
+            uint8_t * ptr = it->second.host_ptr(op_handle->part);
+            if (ptr == nullptr) {
+                GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(op_handle->part));
+            }
+            return ptr;
+        }
     }
 
-    uint8_t * ptr = it->second.host_ptr(op_handle->part);
-    if (ptr == nullptr) {
-        GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(op_handle->part));
+    try {
+        std::lock_guard<std::mutex> lock(op_handle->mutex);
+        auto existing = op_handle->handles.find(expert);
+        if (existing != op_handle->handles.end()) {
+            uint8_t * ptr = existing->second.host_ptr(op_handle->part);
+            if (ptr == nullptr) {
+                GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(op_handle->part));
+            }
+            return ptr;
+        }
+
+        ExpertHandle handle = op_handle->ticket.get_handle(op_handle->layer, expert);
+        auto [it, inserted] = op_handle->handles.emplace(expert, std::move(handle));
+        (void) inserted;
+
+        uint8_t * ptr = it->second.host_ptr(op_handle->part);
+        if (ptr == nullptr) {
+            GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(op_handle->part));
+        }
+        return ptr;
+    } catch (const std::exception & e) {
+        GGML_ABORT("MoE expert %d get handle failed: %s", expert, e.what());
+    } catch (...) {
+        GGML_ABORT("MoE expert %d get handle failed", expert);
     }
 
-    return ptr;
+    return fallback;
+}
+
+const void * llama_moe_expert_wait_any_ready_callback(
+        void *,
+        void * handle,
+        const int32_t * experts,
+        int32_t count,
+        int32_t * expert_out) {
+    auto * op_handle = static_cast<llama_moe_expert_op_handle *>(handle);
+    if (op_handle == nullptr || experts == nullptr || count <= 0 || expert_out == nullptr) {
+        return nullptr;
+    }
+
+    try {
+        std::lock_guard<std::mutex> lock(op_handle->mutex);
+
+        for (int32_t i = 0; i < count; ++i) {
+            const int32_t expert = experts[i];
+            auto it = op_handle->handles.find(expert);
+            if (it != op_handle->handles.end()) {
+                uint8_t * ptr = it->second.host_ptr(op_handle->part);
+                if (ptr == nullptr) {
+                    GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(op_handle->part));
+                }
+                *expert_out = expert;
+                return ptr;
+            }
+        }
+
+        auto ready = op_handle->ticket.wait_any_ready(
+                op_handle->layer,
+                experts,
+                static_cast<size_t>(count));
+        const int32_t expert = ready.first;
+        auto [it, inserted] = op_handle->handles.emplace(expert, std::move(ready.second));
+        (void) inserted;
+
+        uint8_t * ptr = it->second.host_ptr(op_handle->part);
+        if (ptr == nullptr) {
+            GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(op_handle->part));
+        }
+        *expert_out = expert;
+        return ptr;
+    } catch (const std::exception & e) {
+        GGML_ABORT("MoE wait_any_ready failed: %s", e.what());
+    } catch (...) {
+        GGML_ABORT("MoE wait_any_ready failed");
+    }
+
+    return nullptr;
 }
 
 void llama_moe_expert_release_callback(void *, void * handle) {
@@ -216,6 +337,7 @@ void llama_moe_expert_install_callback() {
         ggml_moe_expert_set_callback(
                 llama_moe_expert_ensure_callback,
                 llama_moe_expert_get_data_callback,
+                llama_moe_expert_wait_any_ready_callback,
                 llama_moe_expert_release_callback,
                 nullptr);
     });

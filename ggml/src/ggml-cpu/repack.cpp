@@ -14,6 +14,8 @@
 #include <cmath>
 #include <cstring>
 #include <cassert>
+#include <climits>
+#include <cstdint>
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
@@ -4155,6 +4157,14 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
 };
 
+struct mmid_moe_ready_state {
+    void *       handle;
+    const void * cur_src0;
+    int32_t      cur_a;
+    int32_t      pending_count;
+    int32_t      done;
+};
+
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
 
     bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
@@ -4167,7 +4177,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
             case GGML_OP_MUL_MAT_ID:
                 {
-                    size = GGML_PAD(sizeof(void *), sizeof(int64_t));
+                    size = GGML_PAD(sizeof(mmid_moe_ready_state), sizeof(int64_t));
                     size += ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
                     size = GGML_PAD(size, sizeof(int64_t)); // + padding for next block.
 
@@ -4177,6 +4187,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
 
                     size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
+                    size += ne02*sizeof(int32_t);
 
                     return true;
                 }
@@ -4395,12 +4406,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int ith = params->ith;
         const int nth = params->nth;
 
-        auto ** moe_expert_handle_slot = (void **) params->wdata;
+        auto * moe_state = (mmid_moe_ready_state *) params->wdata;
         if (ith == 0) {
-            *moe_expert_handle_slot = ggml_moe_expert_ensure(src0, ids);
+            moe_state->handle = ggml_moe_expert_ensure(src0, ids);
+            moe_state->cur_src0 = nullptr;
+            moe_state->cur_a = -1;
+            moe_state->pending_count = 0;
+            moe_state->done = 0;
         }
         ggml_barrier(params->threadpool);
-        void * moe_expert_handle = *moe_expert_handle_slot;
+        void * moe_expert_handle = moe_state->handle;
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
 
@@ -4434,17 +4449,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         };
 
         GGML_ASSERT(params->wsize >=
-                (GGML_PAD(sizeof(void *), sizeof(int64_t)) +
+                (GGML_PAD(sizeof(mmid_moe_ready_state), sizeof(int64_t)) +
                  GGML_PAD(nbw3, sizeof(int64_t)) +
-                 n_as*(ne12 + 1)*sizeof(mmid_row_mapping))
+                 n_as*(ne12 + 1)*sizeof(mmid_row_mapping) +
+                 n_as*sizeof(int32_t))
                 );
 
-        auto * wdata          = (char *)params->wdata + GGML_PAD(sizeof(void *), sizeof(int64_t));
+        auto * wdata          = (char *)params->wdata + GGML_PAD(sizeof(mmid_moe_ready_state), sizeof(int64_t));
         auto * wdata_src1_end = (char *)wdata + GGML_PAD(nbw3, sizeof(int64_t));
 
         // total of [n_as][ne12 + 1] elements of type mmid_row_mapping (2*int32_t = int64_t)
         auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                                        // [n_as]
         struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
+        int32_t * pending_experts = (int32_t *) (matrix_rows + n_as*ne12);                              // [n_as]
 
         // src1: float32 => param type
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
@@ -4473,22 +4490,22 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     matrix_row_counts[i02] += 1;
                 }
             }
+
+            int32_t pending_count = 0;
+            for (int64_t cur_a = 0; cur_a < n_as; ++cur_a) {
+                if (matrix_row_counts[cur_a] > 0) {
+                    GGML_ASSERT(cur_a <= INT32_MAX);
+                    pending_experts[pending_count++] = (int32_t) cur_a;
+                }
+            }
+            moe_state->pending_count = pending_count;
         }
 
         ggml_barrier(params->threadpool);
 
-        // compute each matrix multiplication in sequence
-        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+        auto compute_one_expert = [&](int32_t cur_a, const char * src0_cur) {
             const int64_t cne1 = matrix_row_counts[cur_a];
-
-            if (cne1 == 0) {
-                continue;
-            }
-
-            const auto * src0_cur = (const char *) ggml_moe_expert_get_data(
-                    moe_expert_handle,
-                    cur_a,
-                    src0->data != nullptr ? (const char *) src0->data + cur_a*nb02 : nullptr);
+            GGML_ASSERT(cne1 > 0);
             GGML_ASSERT(src0_cur != nullptr);
 
             //const int64_t nr0 = ne01; // src0 rows
@@ -4505,7 +4522,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             if (src0_cur_start >= src0_cur_end) {
-                goto done;
+                return;
             }
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {
@@ -4524,6 +4541,73 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
                     ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
                     src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
+            }
+        };
+
+        if (moe_expert_handle == nullptr) {
+            // Fallback for ordinary in-memory tensors: keep the original order
+            // and use src0 offsets directly through ggml_moe_expert_get_data().
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                const int64_t cne1 = matrix_row_counts[cur_a];
+
+                if (cne1 == 0) {
+                    continue;
+                }
+
+                const auto * src0_cur = (const char *) ggml_moe_expert_get_data(
+                        moe_expert_handle,
+                        cur_a,
+                        src0->data != nullptr ? (const char *) src0->data + cur_a*nb02 : nullptr);
+                compute_one_expert(cur_a, src0_cur);
+            }
+        } else {
+            while (true) {
+                if (ith == 0) {
+                    if (moe_state->pending_count == 0) {
+                        moe_state->done = 1;
+                        moe_state->cur_a = -1;
+                        moe_state->cur_src0 = nullptr;
+                    } else {
+                        int32_t ready_expert = -1;
+                        const void * ready_src0 = ggml_moe_expert_wait_any_ready(
+                                moe_expert_handle,
+                                pending_experts,
+                                moe_state->pending_count,
+                                &ready_expert);
+                        GGML_ASSERT(ready_src0 != nullptr);
+                        GGML_ASSERT(ready_expert >= 0 && ready_expert < n_as);
+                        GGML_ASSERT(matrix_row_counts[ready_expert] > 0);
+
+                        moe_state->done = 0;
+                        moe_state->cur_a = ready_expert;
+                        moe_state->cur_src0 = ready_src0;
+                    }
+                }
+
+                ggml_barrier(params->threadpool);
+
+                if (moe_state->done) {
+                    break;
+                }
+
+                compute_one_expert(moe_state->cur_a, (const char *) moe_state->cur_src0);
+
+                ggml_barrier(params->threadpool);
+
+                if (ith == 0) {
+                    bool removed = false;
+                    for (int32_t i = 0; i < moe_state->pending_count; ++i) {
+                        if (pending_experts[i] == moe_state->cur_a) {
+                            pending_experts[i] = pending_experts[moe_state->pending_count - 1];
+                            moe_state->pending_count -= 1;
+                            removed = true;
+                            break;
+                        }
+                    }
+                    GGML_ASSERT(removed);
+                }
+
+                ggml_barrier(params->threadpool);
             }
         }
 

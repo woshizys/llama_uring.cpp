@@ -55,16 +55,19 @@
 
 static ggml_moe_expert_ensure_callback   g_moe_expert_ensure_cb   = NULL;
 static ggml_moe_expert_get_data_callback g_moe_expert_get_data_cb = NULL;
+static ggml_moe_expert_wait_any_ready_callback g_moe_expert_wait_any_ready_cb = NULL;
 static ggml_moe_expert_release_callback  g_moe_expert_release_cb  = NULL;
 static void * g_moe_expert_cb_data = NULL;
 
 void ggml_moe_expert_set_callback(
         ggml_moe_expert_ensure_callback ensure,
         ggml_moe_expert_get_data_callback get_data,
+        ggml_moe_expert_wait_any_ready_callback wait_any_ready,
         ggml_moe_expert_release_callback release,
         void * data) {
     g_moe_expert_ensure_cb = ensure;
     g_moe_expert_get_data_cb = get_data;
+    g_moe_expert_wait_any_ready_cb = wait_any_ready;
     g_moe_expert_release_cb = release;
     g_moe_expert_cb_data = data;
 }
@@ -81,6 +84,13 @@ const void * ggml_moe_expert_get_data(void * handle, int32_t expert, const void 
         return fallback;
     }
     return g_moe_expert_get_data_cb(g_moe_expert_cb_data, handle, expert, fallback);
+}
+
+const void * ggml_moe_expert_wait_any_ready(void * handle, const int32_t * experts, int32_t count, int32_t * expert_out) {
+    if (handle == NULL || g_moe_expert_wait_any_ready_cb == NULL) {
+        return NULL;
+    }
+    return g_moe_expert_wait_any_ready_cb(g_moe_expert_cb_data, handle, experts, count, expert_out);
 }
 
 void ggml_moe_expert_release(void * handle) {
