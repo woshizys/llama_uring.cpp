@@ -704,18 +704,21 @@ extern "C" {
     // opaque handle is released after the op finishes.
     typedef void *       (*ggml_moe_expert_ensure_callback)(void * data, const struct ggml_tensor * src0, const struct ggml_tensor * ids);
     typedef const void * (*ggml_moe_expert_get_data_callback)(void * data, void * handle, int32_t expert, const void * fallback);
+    typedef const void * (*ggml_moe_expert_get_device_data_callback)(void * data, void * handle, int32_t expert, const void * fallback);
     typedef const void * (*ggml_moe_expert_wait_any_ready_callback)(void * data, void * handle, const int32_t * experts, int32_t count, int32_t * expert_out);
     typedef void         (*ggml_moe_expert_release_callback)(void * data, void * handle);
 
     GGML_API void ggml_moe_expert_set_callback(
             ggml_moe_expert_ensure_callback  ensure,
             ggml_moe_expert_get_data_callback get_data,
+            ggml_moe_expert_get_device_data_callback get_device_data,
             ggml_moe_expert_wait_any_ready_callback wait_any_ready,
             ggml_moe_expert_release_callback release,
             void * data);
 
     GGML_API void * ggml_moe_expert_ensure(const struct ggml_tensor * src0, const struct ggml_tensor * ids);
     GGML_API const void * ggml_moe_expert_get_data(void * handle, int32_t expert, const void * fallback);
+    GGML_API const void * ggml_moe_expert_get_device_data(void * handle, int32_t expert, const void * fallback);
     GGML_API const void * ggml_moe_expert_wait_any_ready(void * handle, const int32_t * experts, int32_t count, int32_t * expert_out);
     GGML_API void   ggml_moe_expert_release(void * handle);
 

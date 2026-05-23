@@ -72,6 +72,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <deque>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -81,9 +82,116 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+struct ggml_cuda_moe_ids_cache_entry {
+    size_t nbytes = 0;
+    int64_t ne[GGML_MAX_DIMS] = {};
+    int64_t nb[GGML_MAX_DIMS] = {};
+    std::vector<char> data;
+    std::vector<const ggml_tensor *> seen_src0;
+};
+
+static std::mutex & ggml_cuda_moe_ids_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::unordered_map<const ggml_tensor *, ggml_cuda_moe_ids_cache_entry> & ggml_cuda_moe_ids_cache() {
+    static std::unordered_map<const ggml_tensor *, ggml_cuda_moe_ids_cache_entry> cache;
+    return cache;
+}
+
+static bool ggml_cuda_moe_ids_cache_entry_matches(const ggml_cuda_moe_ids_cache_entry & entry, const ggml_tensor * ids) {
+    if (entry.nbytes != ggml_nbytes(ids) || entry.data.size() != entry.nbytes) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (entry.ne[i] != ids->ne[i] || entry.nb[i] != (int64_t) ids->nb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_cuda_moe_ids_cache_seen_src0(const ggml_cuda_moe_ids_cache_entry & entry, const ggml_tensor * src0) {
+    return std::find(entry.seen_src0.begin(), entry.seen_src0.end(), src0) != entry.seen_src0.end();
+}
+
+struct ggml_cuda_moe_release_item {
+    cudaEvent_t event;
+    void * handle;
+};
+
+class ggml_cuda_moe_release_queue {
+public:
+    ggml_cuda_moe_release_queue() : worker(&ggml_cuda_moe_release_queue::run, this) {
+    }
+
+    ~ggml_cuda_moe_release_queue() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        cv.notify_one();
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    void enqueue(cudaEvent_t event, void * handle) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            items.push_back({ event, handle });
+        }
+        cv.notify_one();
+    }
+
+private:
+    void run() {
+        for (;;) {
+            ggml_cuda_moe_release_item item{};
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&] { return stop || !items.empty(); });
+                if (items.empty()) {
+                    if (stop) {
+                        break;
+                    }
+                    continue;
+                }
+                item = items.front();
+                items.pop_front();
+            }
+
+            CUDA_CHECK(cudaEventSynchronize(item.event));
+            ggml_moe_expert_release(item.handle);
+            CUDA_CHECK(cudaEventDestroy(item.event));
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<ggml_cuda_moe_release_item> items;
+    std::thread worker;
+    bool stop = false;
+};
+
+static ggml_cuda_moe_release_queue & ggml_cuda_moe_release_queue_instance() {
+    static ggml_cuda_moe_release_queue queue;
+    return queue;
+}
+
+static void ggml_cuda_moe_expert_release_after_stream(cudaStream_t stream, void * handle) {
+    cudaEvent_t event = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(event, stream));
+    ggml_cuda_moe_release_queue_instance().enqueue(event, handle);
+}
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -2491,6 +2599,79 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool use_external_moe = (src0->flags & GGML_TENSOR_FLAG_EXTERNAL) != 0;
+    cudaStream_t stream = ctx.stream();
+
+    std::vector<char> ids_host;
+    void * moe_expert_handle = nullptr;
+    ggml_cuda_pool_alloc<const void *> moe_expert_ptrs_dev(ctx.pool());
+    const void * const * moe_expert_ptrs = nullptr;
+
+    if (use_external_moe) {
+        bool ids_cache_hit = false;
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_moe_ids_cache_mutex());
+            auto & cache = ggml_cuda_moe_ids_cache();
+            auto it = cache.find(ids);
+            if (it != cache.end()
+                    && ggml_cuda_moe_ids_cache_entry_matches(it->second, ids)
+                    && !ggml_cuda_moe_ids_cache_seen_src0(it->second, src0)) {
+                ids_host = it->second.data;
+                it->second.seen_src0.push_back(src0);
+                ids_cache_hit = true;
+            } else if (it != cache.end() && !ggml_cuda_moe_ids_cache_entry_matches(it->second, ids)) {
+                cache.erase(it);
+            }
+        }
+
+        if (!ids_cache_hit) {
+            ids_host.resize(ggml_nbytes(ids));
+            CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            ggml_cuda_moe_ids_cache_entry entry;
+            entry.nbytes = ids_host.size();
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                entry.ne[i] = ids->ne[i];
+                entry.nb[i] = ids->nb[i];
+            }
+            entry.data = ids_host;
+            entry.seen_src0.push_back(src0);
+
+            std::lock_guard<std::mutex> lock(ggml_cuda_moe_ids_cache_mutex());
+            auto & cache = ggml_cuda_moe_ids_cache();
+            cache[ids] = std::move(entry);
+            if (cache.size() > 4096) {
+                cache.clear();
+            }
+        }
+
+        ggml_tensor ids_host_tensor = *ids;
+        ids_host_tensor.data = ids_host.data();
+        moe_expert_handle = ggml_moe_expert_ensure(src0, &ids_host_tensor);
+        GGML_ASSERT(moe_expert_handle != nullptr && "external CUDA MUL_MAT_ID requires MoE expert callback");
+
+        std::vector<const void *> expert_ptrs_host(ne02, nullptr);
+        std::vector<bool> active_expert(ne02, false);
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+            for (int64_t id = 0; id < ids->ne[0]; ++id) {
+                const int32_t expert =
+                    *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
+                GGML_ASSERT(expert >= 0 && expert < ne02);
+                active_expert[expert] = true;
+            }
+        }
+        for (int64_t expert = 0; expert < ne02; ++expert) {
+            if (!active_expert[expert]) {
+                continue;
+            }
+            expert_ptrs_host[expert] = ggml_moe_expert_get_device_data(moe_expert_handle, expert, nullptr);
+            GGML_ASSERT(expert_ptrs_host[expert] != nullptr && "external CUDA MUL_MAT_ID active expert has no device pointer");
+        }
+        moe_expert_ptrs_dev.alloc(ne02);
+        CUDA_CHECK(cudaMemcpyAsync(moe_expert_ptrs_dev.ptr, expert_ptrs_host.data(), ne02*sizeof(const void *), cudaMemcpyHostToDevice, stream));
+        moe_expert_ptrs = moe_expert_ptrs_dev.ptr;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -2499,10 +2680,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst, nullptr, moe_expert_ptrs);
+                    if (moe_expert_handle != nullptr) {
+                        ggml_cuda_moe_expert_release_after_stream(stream, moe_expert_handle);
+                    }
                     return;
                 }
-            } else {
+            } else if (!use_external_moe) {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
@@ -2511,19 +2695,20 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst, moe_expert_ptrs);
+            if (moe_expert_handle != nullptr) {
+                ggml_cuda_moe_expert_release_after_stream(stream, moe_expert_handle);
+            }
             return;
         }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        if (!use_external_moe && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
     }
 
-    // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
-    // TODO: add asserts to verify this. should work with CUDA, HIP, etc.
-    cudaStream_t stream = ctx.stream();
+    // note: this path should not be reached when recording CUDA graphs, because it requires CPU-side routing and IO scheduling
 
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
@@ -2548,9 +2733,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
-    std::vector<char> ids_host(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (ids_host.empty()) {
+        ids_host.resize(ggml_nbytes(ids));
+        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
@@ -2594,7 +2781,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src0_slice.nb[3]    = src0_slice.nb[2];
         src0_slice.op       = GGML_OP_VIEW;
         src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-        src0_slice.data     = (char *) src0->data + i02*nb02;
+        src0_slice.data     = use_external_moe
+            ? const_cast<void *>(ggml_moe_expert_get_device_data(moe_expert_handle, i02, nullptr))
+            : (char *) src0->data + i02*nb02;
+        GGML_ASSERT(src0_slice.data != nullptr);
 
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));
@@ -2635,6 +2825,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+
+    if (moe_expert_handle != nullptr) {
+        ggml_cuda_moe_expert_release_after_stream(stream, moe_expert_handle);
+    }
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
@@ -3119,9 +3313,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
+            if ((node->src[0]->flags & GGML_TENSOR_FLAG_EXTERNAL) != 0) {
+                use_cuda_graph = false;
+#ifndef NDEBUG
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to external MoE tensor\n", __func__);
+#endif
+            }
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+            if (use_cuda_graph && (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max)) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
@@ -4882,8 +5082,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (a == nullptr || b == nullptr) {
                     return false;
                 }
-                if (op->op == GGML_OP_MUL_MAT_ID &&
-                    ((a->flags & GGML_TENSOR_FLAG_EXTERNAL) || a->buffer == nullptr)) {
+                if (op->op == GGML_OP_MUL_MAT_ID && a->buffer == nullptr) {
                     return false;
                 }
                 if (a->buffer && ggml_backend_buft_is_cuda_split(a->buffer->buft)) {
@@ -5224,7 +5423,7 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
 
     if (op->op == GGML_OP_MUL_MAT_ID &&
         op->src[0] != nullptr &&
-        ((op->src[0]->flags & GGML_TENSOR_FLAG_EXTERNAL) || op->src[0]->buffer == nullptr)) {
+        op->src[0]->buffer == nullptr) {
         return false;
     }
 

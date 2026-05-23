@@ -28,6 +28,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <regex>
@@ -50,6 +51,15 @@ __attribute__((weak)) llama_expert_manager_ffi * llama_expert_manager_new(
 
 __attribute__((weak)) llama_expert_manager_ffi * llama_expert_manager_new_with_slot_size(
         size_t,
+        size_t) {
+    return nullptr;
+}
+
+__attribute__((weak)) llama_expert_manager_ffi * llama_expert_manager_new_with_layout(
+        size_t,
+        size_t,
+        int32_t,
+        const int32_t *,
         size_t) {
     return nullptr;
 }
@@ -118,9 +128,19 @@ __attribute__((weak)) uint8_t * llama_expert_handle_host_ptr(
     return nullptr;
 }
 
+__attribute__((weak)) uint8_t * llama_expert_handle_host_base_ptr(
+        const llama_expert_handle_ffi *) {
+    return nullptr;
+}
+
 __attribute__((weak)) const uint8_t * llama_expert_handle_device_ptr(
         const llama_expert_handle_ffi *,
         int32_t) {
+    return nullptr;
+}
+
+__attribute__((weak)) const uint8_t * llama_expert_handle_device_base_ptr(
+        const llama_expert_handle_ffi *) {
     return nullptr;
 }
 
@@ -175,15 +195,164 @@ struct llama_moe_tensor_meta {
     MoePart part = MoePart::Up;
 };
 
-struct llama_moe_expert_op_handle {
-    MoePart part = MoePart::Up;
+struct llama_moe_expert_shared_key {
+    ExpertManager * manager = nullptr;
+    int32_t layer = -1;
+    std::vector<int32_t> experts;
+
+    bool operator==(const llama_moe_expert_shared_key & other) const {
+        return manager == other.manager && layer == other.layer && experts == other.experts;
+    }
+};
+
+struct llama_moe_expert_shared_key_hash {
+    size_t operator()(const llama_moe_expert_shared_key & key) const {
+        size_t h = std::hash<void *>{}(key.manager);
+        h ^= std::hash<int32_t>{}(key.layer) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        for (const int32_t expert : key.experts) {
+            h ^= std::hash<int32_t>{}(expert) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        }
+        return h;
+    }
+};
+
+struct llama_moe_expert_shared_state {
     int32_t layer = -1;
     ExpertTicket ticket;
     std::unordered_map<int32_t, ExpertHandle> handles;
     std::mutex mutex;
 
-    llama_moe_expert_op_handle(MoePart part, int32_t layer, ExpertTicket ticket)
-        : part(part), layer(layer), ticket(std::move(ticket)) {}
+    llama_moe_expert_shared_state(int32_t layer, ExpertTicket ticket)
+        : layer(layer), ticket(std::move(ticket)) {}
+
+    const void * get_host(MoePart part, int32_t expert, const void * fallback) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = handles.find(expert);
+            if (it != handles.end()) {
+                uint8_t * ptr = it->second.host_ptr(part);
+                if (ptr == nullptr) {
+                    GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(part));
+                }
+                return ptr;
+            }
+        }
+
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto existing = handles.find(expert);
+            if (existing != handles.end()) {
+                uint8_t * ptr = existing->second.host_ptr(part);
+                if (ptr == nullptr) {
+                    GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(part));
+                }
+                return ptr;
+            }
+
+            ExpertHandle handle = ticket.get_handle(layer, expert);
+            auto [it, inserted] = handles.emplace(expert, std::move(handle));
+            (void) inserted;
+
+            uint8_t * ptr = it->second.host_ptr(part);
+            if (ptr == nullptr) {
+                GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(part));
+            }
+            return ptr;
+        } catch (const std::exception & e) {
+            GGML_ABORT("MoE expert %d get handle failed: %s", expert, e.what());
+        } catch (...) {
+            GGML_ABORT("MoE expert %d get handle failed", expert);
+        }
+
+        return fallback;
+    }
+
+    const void * get_device(MoePart part, int32_t expert, const void * fallback) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = handles.find(expert);
+            if (it != handles.end()) {
+                const uint8_t * ptr = it->second.device_ptr(part);
+                if (ptr == nullptr) {
+                    GGML_ABORT("MoE expert %d has null device cache pointer for part %d", expert, static_cast<int>(part));
+                }
+                return ptr;
+            }
+        }
+
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto existing = handles.find(expert);
+            if (existing != handles.end()) {
+                const uint8_t * ptr = existing->second.device_ptr(part);
+                if (ptr == nullptr) {
+                    GGML_ABORT("MoE expert %d has null device cache pointer for part %d", expert, static_cast<int>(part));
+                }
+                return ptr;
+            }
+
+            ExpertHandle handle = ticket.get_handle(layer, expert);
+            auto [it, inserted] = handles.emplace(expert, std::move(handle));
+            (void) inserted;
+
+            const uint8_t * ptr = it->second.device_ptr(part);
+            if (ptr == nullptr) {
+                GGML_ABORT("MoE expert %d has null device cache pointer for part %d", expert, static_cast<int>(part));
+            }
+            return ptr;
+        } catch (const std::exception & e) {
+            GGML_ABORT("MoE expert %d get device handle failed: %s", expert, e.what());
+        } catch (...) {
+            GGML_ABORT("MoE expert %d get device handle failed", expert);
+        }
+
+        return fallback;
+    }
+
+    const void * wait_any_ready(MoePart part, const int32_t * experts, int32_t count, int32_t * expert_out) {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+
+            for (int32_t i = 0; i < count; ++i) {
+                const int32_t expert = experts[i];
+                auto it = handles.find(expert);
+                if (it != handles.end()) {
+                    uint8_t * ptr = it->second.host_ptr(part);
+                    if (ptr == nullptr) {
+                        GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(part));
+                    }
+                    *expert_out = expert;
+                    return ptr;
+                }
+            }
+
+            auto ready = ticket.wait_any_ready(layer, experts, static_cast<size_t>(count));
+            const int32_t expert = ready.first;
+            auto [it, inserted] = handles.emplace(expert, std::move(ready.second));
+            (void) inserted;
+
+            uint8_t * ptr = it->second.host_ptr(part);
+            if (ptr == nullptr) {
+                GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(part));
+            }
+            *expert_out = expert;
+            return ptr;
+        } catch (const std::exception & e) {
+            GGML_ABORT("MoE wait_any_ready failed: %s", e.what());
+        } catch (...) {
+            GGML_ABORT("MoE wait_any_ready failed");
+        }
+
+        return nullptr;
+    }
+};
+
+struct llama_moe_expert_op_handle {
+    MoePart part = MoePart::Up;
+    std::shared_ptr<llama_moe_expert_shared_state> state;
+
+    llama_moe_expert_op_handle(MoePart part, std::shared_ptr<llama_moe_expert_shared_state> state)
+        : part(part), state(std::move(state)) {}
 };
 
 std::mutex & llama_moe_registry_mutex() {
@@ -194,6 +363,22 @@ std::mutex & llama_moe_registry_mutex() {
 std::unordered_map<const ggml_tensor *, llama_moe_tensor_meta> & llama_moe_registry() {
     static std::unordered_map<const ggml_tensor *, llama_moe_tensor_meta> registry;
     return registry;
+}
+
+std::mutex & llama_moe_shared_cache_mutex() {
+    static std::mutex mu;
+    return mu;
+}
+
+std::unordered_map<
+        llama_moe_expert_shared_key,
+        std::weak_ptr<llama_moe_expert_shared_state>,
+        llama_moe_expert_shared_key_hash> & llama_moe_shared_cache() {
+    static std::unordered_map<
+            llama_moe_expert_shared_key,
+            std::weak_ptr<llama_moe_expert_shared_state>,
+            llama_moe_expert_shared_key_hash> cache;
+    return cache;
 }
 
 void * llama_moe_expert_ensure_callback(void *, const ggml_tensor * src0, const ggml_tensor * ids) {
@@ -207,22 +392,64 @@ void * llama_moe_expert_ensure_callback(void *, const ggml_tensor * src0, const 
         meta = it->second;
     }
 
-    std::vector<ExpertKey> experts;
-    experts.reserve(static_cast<size_t>(ids->ne[0] * ids->ne[1]));
+    std::vector<int32_t> active_experts;
+    active_experts.reserve(static_cast<size_t>(ids->ne[0] * ids->ne[1]));
 
     for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
         for (int64_t id = 0; id < ids->ne[0]; ++id) {
             const int32_t expert =
                 *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
-            experts.push_back({ meta.layer, expert });
+            active_experts.push_back(expert);
         }
     }
 
+    std::sort(active_experts.begin(), active_experts.end());
+    active_experts.erase(std::unique(active_experts.begin(), active_experts.end()), active_experts.end());
+
+    llama_moe_expert_shared_key key;
+    key.manager = meta.manager;
+    key.layer = meta.layer;
+    key.experts = active_experts;
+
+    {
+        std::lock_guard<std::mutex> lock(llama_moe_shared_cache_mutex());
+        auto & cache = llama_moe_shared_cache();
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            if (auto state = it->second.lock()) {
+                return new llama_moe_expert_op_handle(meta.part, std::move(state));
+            }
+            cache.erase(it);
+        }
+
+        if (cache.size() > 1024) {
+            for (auto scan = cache.begin(); scan != cache.end();) {
+                if (scan->second.expired()) {
+                    scan = cache.erase(scan);
+                } else {
+                    ++scan;
+                }
+            }
+        }
+    }
+
+    std::vector<ExpertKey> experts;
+    experts.reserve(active_experts.size());
+    for (const int32_t expert : active_experts) {
+        experts.push_back({ meta.layer, expert });
+    }
+
     try {
-        return new llama_moe_expert_op_handle(
-                meta.part,
+        auto state = std::make_shared<llama_moe_expert_shared_state>(
                 meta.layer,
                 meta.manager->submit_batch_async(std::move(experts)));
+
+        {
+            std::lock_guard<std::mutex> lock(llama_moe_shared_cache_mutex());
+            llama_moe_shared_cache()[std::move(key)] = state;
+        }
+
+        return new llama_moe_expert_op_handle(meta.part, std::move(state));
     } catch (const std::exception & e) {
         GGML_ABORT("MoE expert ensure failed: %s", e.what());
     } catch (...) {
@@ -232,49 +459,18 @@ void * llama_moe_expert_ensure_callback(void *, const ggml_tensor * src0, const 
 
 const void * llama_moe_expert_get_data_callback(void *, void * handle, int32_t expert, const void * fallback) {
     auto * op_handle = static_cast<llama_moe_expert_op_handle *>(handle);
-    if (op_handle == nullptr) {
+    if (op_handle == nullptr || !op_handle->state) {
         return fallback;
     }
+    return op_handle->state->get_host(op_handle->part, expert, fallback);
+}
 
-    {
-        std::lock_guard<std::mutex> lock(op_handle->mutex);
-        auto it = op_handle->handles.find(expert);
-        if (it != op_handle->handles.end()) {
-            uint8_t * ptr = it->second.host_ptr(op_handle->part);
-            if (ptr == nullptr) {
-                GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(op_handle->part));
-            }
-            return ptr;
-        }
+const void * llama_moe_expert_get_device_data_callback(void *, void * handle, int32_t expert, const void * fallback) {
+    auto * op_handle = static_cast<llama_moe_expert_op_handle *>(handle);
+    if (op_handle == nullptr || !op_handle->state) {
+        return fallback;
     }
-
-    try {
-        std::lock_guard<std::mutex> lock(op_handle->mutex);
-        auto existing = op_handle->handles.find(expert);
-        if (existing != op_handle->handles.end()) {
-            uint8_t * ptr = existing->second.host_ptr(op_handle->part);
-            if (ptr == nullptr) {
-                GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(op_handle->part));
-            }
-            return ptr;
-        }
-
-        ExpertHandle handle = op_handle->ticket.get_handle(op_handle->layer, expert);
-        auto [it, inserted] = op_handle->handles.emplace(expert, std::move(handle));
-        (void) inserted;
-
-        uint8_t * ptr = it->second.host_ptr(op_handle->part);
-        if (ptr == nullptr) {
-            GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(op_handle->part));
-        }
-        return ptr;
-    } catch (const std::exception & e) {
-        GGML_ABORT("MoE expert %d get handle failed: %s", expert, e.what());
-    } catch (...) {
-        GGML_ABORT("MoE expert %d get handle failed", expert);
-    }
-
-    return fallback;
+    return op_handle->state->get_device(op_handle->part, expert, fallback);
 }
 
 const void * llama_moe_expert_wait_any_ready_callback(
@@ -284,47 +480,10 @@ const void * llama_moe_expert_wait_any_ready_callback(
         int32_t count,
         int32_t * expert_out) {
     auto * op_handle = static_cast<llama_moe_expert_op_handle *>(handle);
-    if (op_handle == nullptr || experts == nullptr || count <= 0 || expert_out == nullptr) {
+    if (op_handle == nullptr || !op_handle->state || experts == nullptr || count <= 0 || expert_out == nullptr) {
         return nullptr;
     }
-
-    try {
-        std::lock_guard<std::mutex> lock(op_handle->mutex);
-
-        for (int32_t i = 0; i < count; ++i) {
-            const int32_t expert = experts[i];
-            auto it = op_handle->handles.find(expert);
-            if (it != op_handle->handles.end()) {
-                uint8_t * ptr = it->second.host_ptr(op_handle->part);
-                if (ptr == nullptr) {
-                    GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(op_handle->part));
-                }
-                *expert_out = expert;
-                return ptr;
-            }
-        }
-
-        auto ready = op_handle->ticket.wait_any_ready(
-                op_handle->layer,
-                experts,
-                static_cast<size_t>(count));
-        const int32_t expert = ready.first;
-        auto [it, inserted] = op_handle->handles.emplace(expert, std::move(ready.second));
-        (void) inserted;
-
-        uint8_t * ptr = it->second.host_ptr(op_handle->part);
-        if (ptr == nullptr) {
-            GGML_ABORT("MoE expert %d has null host cache pointer for part %d", expert, static_cast<int>(op_handle->part));
-        }
-        *expert_out = expert;
-        return ptr;
-    } catch (const std::exception & e) {
-        GGML_ABORT("MoE wait_any_ready failed: %s", e.what());
-    } catch (...) {
-        GGML_ABORT("MoE wait_any_ready failed");
-    }
-
-    return nullptr;
+    return op_handle->state->wait_any_ready(op_handle->part, experts, count, expert_out);
 }
 
 void llama_moe_expert_release_callback(void *, void * handle) {
@@ -337,6 +496,7 @@ void llama_moe_expert_install_callback() {
         ggml_moe_expert_set_callback(
                 llama_moe_expert_ensure_callback,
                 llama_moe_expert_get_data_callback,
+                llama_moe_expert_get_device_data_callback,
                 llama_moe_expert_wait_any_ready_callback,
                 llama_moe_expert_release_callback,
                 nullptr);
@@ -8250,11 +8410,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     ml.done_getting_tensors();
 
     // populate tensors_by_name
-    std::unordered_map<const ggml_tensor *, ggml_backend_buffer_type_t> tensor_buft_map;
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
+        (void) _;
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
-            tensor_buft_map[cur] = _;
         }
     }
 
@@ -8262,80 +8421,126 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         return tensor != nullptr && ml.weights_map.find(ggml_get_name(tensor)) != ml.weights_map.end();
     };
 
-    auto is_cpu_tensor = [&](ggml_tensor * tensor) {
-        auto it = tensor_buft_map.find(tensor);
-        if (it == tensor_buft_map.end()) {
-            return false;
-        }
-
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(it->second);
-        if (dev == nullptr) {
-            // CPU backend buffer type may not report a device.
-            return it->second == ggml_backend_cpu_buffer_type();
-        }
-        return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
-    };
-
-    auto is_cpu_overridden_tensor = [&](ggml_tensor * tensor) {
-        if (tensor == nullptr || params.tensor_buft_overrides == nullptr) {
-            return false;
-        }
-
-        const std::string tensor_name = ggml_get_name(tensor);
-        for (const auto * overrides = params.tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
-            if (overrides->buft == ggml_backend_cpu_buffer_type() && std::regex_search(tensor_name, std::regex(overrides->pattern))) {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    auto is_cpu_moe_tensor = [&](ggml_tensor * tensor) {
-        return has_gguf_weight(tensor) && (is_cpu_tensor(tensor) || is_cpu_overridden_tensor(tensor));
+    auto is_expert_cache_moe_tensor = [&](ggml_tensor * tensor) {
+        return has_gguf_weight(tensor);
     };
 
     if (!expert_manager && params.expert_cache_capacity > 0) {
         if (hparams.n_expert == 0 || hparams.n_ff_exp == 0) {
             LLAMA_LOG_WARN("%s: expert cache capacity was set, but this model has no routed MoE experts; ignoring expert cache\n", __func__);
         } else {
+            constexpr size_t expert_cache_alignment = 4096;
+            TensorLayout expert_cache_layout;
+            expert_cache_layout.kind = TensorLayoutKind::NonContiguous;
+            expert_cache_layout.parts = { MoePart::Up, MoePart::Gate, MoePart::Down, MoePart::GateUp };
+
             size_t slot_size = 0;
             size_t registered_tensor_count = 0;
+            std::vector<size_t> layout_part_sizes(expert_cache_layout.parts.size(), 0);
+            std::vector<bool> layout_part_seen(expert_cache_layout.parts.size(), false);
+            std::vector<bool> expected_presence;
+            bool have_expected_presence = false;
 
-            auto add_tensor_slot_size = [&](ggml_tensor * tensor, size_t & layer_slot_size) {
-                if (!is_cpu_moe_tensor(tensor)) {
+            auto tensor_for_part = [](llama_layer & layer, MoePart part) -> ggml_tensor * {
+                switch (part) {
+                    case MoePart::Up:     return layer.ffn_up_exps;
+                    case MoePart::Gate:   return layer.ffn_gate_exps;
+                    case MoePart::Down:   return layer.ffn_down_exps;
+                    case MoePart::GateUp: return layer.ffn_gate_up_exps;
+                }
+                return nullptr;
+            };
+
+            auto layout_part_slot_size = [&](size_t tensor_size) {
+                if (expert_cache_layout.kind == TensorLayoutKind::NonContiguous) {
+                    return static_cast<size_t>(GGML_PAD(tensor_size, expert_cache_alignment));
+                }
+                return tensor_size;
+            };
+
+            auto note_tensor_slot_size = [&](ggml_tensor * tensor, size_t part_index, size_t & layer_slot_size, std::vector<bool> & layer_presence) {
+                if (!is_expert_cache_moe_tensor(tensor)) {
                     return;
                 }
                 if (tensor->ne[2] <= 0 || tensor->nb[2] == 0) {
-                    return;
+                    throw std::runtime_error(format("invalid MoE expert tensor layout for '%s'", ggml_get_name(tensor)));
                 }
-                layer_slot_size += tensor->nb[2];
+                const size_t tensor_size = tensor->nb[2];
+                if (layout_part_seen[part_index] && layout_part_sizes[part_index] != tensor_size) {
+                    throw std::runtime_error(format(
+                            "MoE expert tensor '%s' has inconsistent per-expert stride: got %zu, expected %zu",
+                            ggml_get_name(tensor),
+                            tensor_size,
+                            layout_part_sizes[part_index]));
+                }
+                layout_part_seen[part_index] = true;
+                layout_part_sizes[part_index] = tensor_size;
+                layer_presence[part_index] = true;
+                layer_slot_size += layout_part_slot_size(tensor_size);
                 registered_tensor_count++;
             };
 
             for (int il = 0; il < static_cast<int>(layers.size()); ++il) {
                 llama_layer & layer = layers[il];
                 size_t layer_slot_size = 0;
-                add_tensor_slot_size(layer.ffn_up_exps,      layer_slot_size);
-                add_tensor_slot_size(layer.ffn_gate_exps,    layer_slot_size);
-                add_tensor_slot_size(layer.ffn_down_exps,    layer_slot_size);
-                add_tensor_slot_size(layer.ffn_gate_up_exps, layer_slot_size);
+                std::vector<bool> layer_presence(expert_cache_layout.parts.size(), false);
+                for (size_t part_index = 0; part_index < expert_cache_layout.parts.size(); ++part_index) {
+                    note_tensor_slot_size(
+                            tensor_for_part(layer, expert_cache_layout.parts[part_index]),
+                            part_index,
+                            layer_slot_size,
+                            layer_presence);
+                }
+                if (layer_slot_size > 0) {
+                    if (!have_expected_presence) {
+                        expected_presence = layer_presence;
+                        have_expected_presence = true;
+                    } else if (layer_presence != expected_presence) {
+                        throw std::runtime_error("MoE expert cache requires a consistent expert tensor layout across layers");
+                    }
+                }
                 slot_size = std::max(slot_size, layer_slot_size);
             }
 
             if (slot_size == 0) {
-                LLAMA_LOG_WARN("%s: expert cache capacity was set, but no CPU MoE expert tensors were found; ignoring expert cache\n", __func__);
+                LLAMA_LOG_WARN("%s: expert cache capacity was set, but no MoE expert tensors were found; ignoring expert cache\n", __func__);
             } else {
-                expert_manager = std::make_unique<ExpertManager>(ExpertManager::create_with_slot_size(
+                size_t layout_offset = 0;
+                for (size_t part_index = 0; part_index < expert_cache_layout.parts.size(); ++part_index) {
+                    if (!layout_part_seen[part_index]) {
+                        continue;
+                    }
+                    const size_t tensor_size = layout_part_sizes[part_index];
+                    const size_t part_slot_size = layout_part_slot_size(tensor_size);
+                    expert_cache_layout.entries.push_back({
+                            expert_cache_layout.parts[part_index],
+                            layout_offset,
+                            tensor_size,
+                            part_slot_size,
+                    });
+                    layout_offset += part_slot_size;
+                }
+                expert_cache_layout.slot_size = layout_offset;
+                if (expert_cache_layout.slot_size != slot_size) {
+                    throw std::runtime_error(format(
+                            "MoE expert cache layout slot size mismatch: layout=%zu, computed=%zu",
+                            expert_cache_layout.slot_size,
+                            slot_size));
+                }
+
+                expert_manager = std::make_unique<ExpertManager>(ExpertManager::create_with_layout(
                         params.expert_cache_capacity,
-                        slot_size));
+                        slot_size,
+                        expert_cache_layout));
                 llama_moe_expert_install_callback();
                 LLAMA_LOG_INFO(
-                        "%s: auto-created MoE expert cache: capacity=%zu, slot_size=%.2f MiB, total_cache=%.2f MiB, registered_moe_tensors=%zu\n",
+                        "%s: auto-created MoE expert cache: capacity=%zu, slot_size=%.2f MiB, total_cache=%.2f MiB, registered_moe_tensors=%zu, layout=%s\n",
                         __func__,
                         params.expert_cache_capacity,
                         slot_size / 1048576.0,
                         (params.expert_cache_capacity * slot_size) / 1048576.0,
-                        registered_tensor_count);
+                        registered_tensor_count,
+                        expert_cache_layout.kind == TensorLayoutKind::NonContiguous ? "non-contiguous" : "contiguous");
             }
         }
     }
@@ -8351,9 +8556,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (!has_gguf_weight(tensor)) {
                 return;
             }
-            if (!is_cpu_moe_tensor(tensor)) {
-                LLAMA_LOG_WARN("%s: MoE expert cache is currently wired only for CPU MUL_MAT_ID; loading GPU tensor '%s' normally\n",
-                        __func__, ggml_get_name(tensor));
+            if (!is_expert_cache_moe_tensor(tensor)) {
                 return;
             }
             tensor->flags |= GGML_TENSOR_FLAG_EXTERNAL;
@@ -8518,6 +8721,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             expert_manager->register_file(static_cast<int32_t>(file_id), ml.file_paths[file_id]);
         }
 
+        auto tensor_for_part = [](llama_layer & layer, MoePart part) -> ggml_tensor * {
+            switch (part) {
+                case MoePart::Up:     return layer.ffn_up_exps;
+                case MoePart::Gate:   return layer.ffn_gate_exps;
+                case MoePart::Down:   return layer.ffn_down_exps;
+                case MoePart::GateUp: return layer.ffn_gate_up_exps;
+            }
+            return nullptr;
+        };
+
         auto register_moe_tensor = [&](ggml_tensor * tensor, int32_t layer, MoePart part) {
             if (tensor == nullptr) {
                 return;
@@ -8527,7 +8740,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (weight == ml.weights_map.end()) {
                 return;
             }
-            if (!is_cpu_moe_tensor(tensor)) {
+            if (!is_expert_cache_moe_tensor(tensor)) {
                 return;
             }
             if (tensor->ne[2] <= 0 || tensor->nb[2] == 0) {
@@ -8561,10 +8774,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         for (int32_t il = 0; il < static_cast<int32_t>(layers.size()); ++il) {
             llama_layer & layer = layers[il];
-            register_moe_tensor(layer.ffn_up_exps,      il, MoePart::Up);
-            register_moe_tensor(layer.ffn_gate_exps,    il, MoePart::Gate);
-            register_moe_tensor(layer.ffn_down_exps,    il, MoePart::Down);
-            register_moe_tensor(layer.ffn_gate_up_exps, il, MoePart::GateUp);
+            for (MoePart part : expert_manager->layout().parts) {
+                register_moe_tensor(tensor_for_part(layer, part), il, part);
+            }
         }
     }
 

@@ -2,7 +2,7 @@
 
 use io_scheduler::expert_manager::{
     ExpertHandle as SchedulerExpertHandle, ExpertKey, ExpertTicket as SchedulerExpertTicket,
-    LlamaExpertManager, MoePart, Slice, TensorMeta,
+    LlamaExpertManager, MoePart, Slice, TensorLayout, TensorLayoutKind, TensorMeta,
 };
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
@@ -24,6 +24,7 @@ pub struct llama_expert_slice_ffi {
 #[derive(Debug)]
 pub enum ExpertCacheError {
     InvalidPart(i32),
+    InvalidLayoutKind(i32),
     InvalidId(&'static str, i32),
     InvalidSize(&'static str),
     IntegerOverflow(&'static str, u64),
@@ -31,6 +32,7 @@ pub enum ExpertCacheError {
     NullHandle,
     NullTicket,
     NullSlice,
+    NullLayoutParts,
     NullPath,
     NullExperts,
     NullExpertOut,
@@ -43,6 +45,7 @@ impl std::fmt::Display for ExpertCacheError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidPart(part) => write!(f, "invalid MoE part: {part}"),
+            Self::InvalidLayoutKind(kind) => write!(f, "invalid tensor layout kind: {kind}"),
             Self::InvalidId(name, value) => write!(f, "invalid {name}: {value}"),
             Self::InvalidSize(name) => write!(f, "{name} must be > 0"),
             Self::IntegerOverflow(name, value) => {
@@ -52,6 +55,7 @@ impl std::fmt::Display for ExpertCacheError {
             Self::NullHandle => write!(f, "null expert handle pointer"),
             Self::NullTicket => write!(f, "null expert ticket pointer"),
             Self::NullSlice => write!(f, "null expert slice pointer"),
+            Self::NullLayoutParts => write!(f, "null tensor layout parts pointer"),
             Self::NullPath => write!(f, "null expert file path pointer"),
             Self::NullExperts => write!(f, "null expert ids pointer"),
             Self::NullExpertOut => write!(f, "null output expert pointer"),
@@ -92,6 +96,14 @@ impl llama_expert_manager_ffi {
     }
 
     pub fn new_with_slot_size(capacity: usize, slot_size: usize) -> Result<Self, ExpertCacheError> {
+        Self::new_with_layout(capacity, slot_size, TensorLayout::default_non_contiguous())
+    }
+
+    pub fn new_with_layout(
+        capacity: usize,
+        slot_size: usize,
+        layout: TensorLayout,
+    ) -> Result<Self, ExpertCacheError> {
         if capacity == 0 {
             return Err(ExpertCacheError::InvalidSize("capacity"));
         }
@@ -106,7 +118,7 @@ impl llama_expert_manager_ffi {
             })?;
         let manager = {
             let _guard = runtime.enter();
-            LlamaExpertManager::new_with_slot_size(capacity, slot_size)
+            LlamaExpertManager::new_with_slot_size_and_layout(capacity, slot_size, layout)
         };
 
         Ok(Self { manager, runtime })
@@ -203,6 +215,33 @@ fn part_from_i32(part: i32) -> Result<MoePart, ExpertCacheError> {
     MoePart::try_from(part).map_err(ExpertCacheError::InvalidPart)
 }
 
+fn layout_kind_from_i32(kind: i32) -> Result<TensorLayoutKind, ExpertCacheError> {
+    TensorLayoutKind::try_from(kind).map_err(ExpertCacheError::InvalidLayoutKind)
+}
+
+fn layout_from_ffi(
+    kind: i32,
+    parts: *const i32,
+    part_count: usize,
+) -> Result<TensorLayout, ExpertCacheError> {
+    if part_count > 0 && parts.is_null() {
+        return Err(ExpertCacheError::NullLayoutParts);
+    }
+
+    let raw_parts = if part_count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(parts, part_count) }
+    };
+    let layout_parts = raw_parts
+        .iter()
+        .copied()
+        .map(part_from_i32)
+        .collect::<Result<Vec<_>, ExpertCacheError>>()?;
+
+    Ok(TensorLayout::new(layout_kind_from_i32(kind)?, layout_parts))
+}
+
 fn id_to_usize(name: &'static str, value: i32) -> Result<usize, ExpertCacheError> {
     usize::try_from(value).map_err(|_| ExpertCacheError::InvalidId(name, value))
 }
@@ -269,6 +308,36 @@ pub extern "C" fn llama_expert_manager_new_with_slot_size(
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         llama_expert_manager_ffi::new_with_slot_size(capacity, slot_size)
+    }));
+
+    match result {
+        Ok(Ok(manager)) => Box::into_raw(Box::new(manager)),
+        Ok(Err(error)) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_last_error(ExpertCacheError::Panic);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Creates an io-scheduler backed expert manager with an exact per-expert slot
+/// size and explicit in-slot tensor layout.
+#[no_mangle]
+pub extern "C" fn llama_expert_manager_new_with_layout(
+    capacity: usize,
+    slot_size: usize,
+    layout_kind: i32,
+    layout_parts: *const i32,
+    part_count: usize,
+) -> *mut llama_expert_manager_ffi {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let layout = layout_from_ffi(layout_kind, layout_parts, part_count)?;
+        llama_expert_manager_ffi::new_with_layout(capacity, slot_size, layout)
     }));
 
     match result {
@@ -616,7 +685,11 @@ pub extern "C" fn llama_expert_ticket_wait_any_ready(
         }
 
         let layer = id_to_usize("layer", layer)?;
-        let expert_ids = unsafe { std::slice::from_raw_parts(experts, count) };
+        let expert_ids = if count == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(experts, count) }
+        };
         let keys = expert_ids
             .iter()
             .copied()
@@ -717,6 +790,54 @@ pub extern "C" fn llama_expert_manager_stats(
         Err(_) => {
             set_last_error(ExpertCacheError::Panic);
             -2
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn llama_expert_handle_host_base_ptr(
+    handle: *const llama_expert_handle_ffi,
+) -> *mut u8 {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let handle = handle_ref(handle)?;
+        Ok(scheduler_handle_ref(handle).host_ptr())
+    }));
+
+    match result {
+        Ok(Ok(ptr)) => ptr,
+        Ok(Err(error)) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_last_error(ExpertCacheError::Panic);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn llama_expert_handle_device_base_ptr(
+    handle: *const llama_expert_handle_ffi,
+) -> *const u8 {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let handle = handle_ref(handle)?;
+        Ok(scheduler_handle_ref(handle).device_ptr())
+    }));
+
+    match result {
+        Ok(Ok(ptr)) => ptr,
+        Ok(Err(error)) => {
+            set_last_error(error);
+            ptr::null()
+        }
+        Err(_) => {
+            set_last_error(ExpertCacheError::Panic);
+            ptr::null()
         }
     }
 }

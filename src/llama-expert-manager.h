@@ -16,6 +16,25 @@ enum class MoePart : int32_t {
     GateUp = 3,
 };
 
+enum class TensorLayoutKind : int32_t {
+    Contiguous    = 0,
+    NonContiguous = 1,
+};
+
+struct TensorLayoutEntry {
+    MoePart part = MoePart::Up;
+    size_t offset = 0;
+    size_t size = 0;
+    size_t slot_size = 0;
+};
+
+struct TensorLayout {
+    TensorLayoutKind kind = TensorLayoutKind::NonContiguous;
+    std::vector<MoePart> parts = { MoePart::Up, MoePart::Gate, MoePart::Down, MoePart::GateUp };
+    std::vector<TensorLayoutEntry> entries;
+    size_t slot_size = 0;
+};
+
 struct ExpertKey {
     int32_t layer  = -1;
     int32_t expert = -1;
@@ -75,6 +94,13 @@ llama_expert_manager_ffi * llama_expert_manager_new_with_slot_size(
         size_t capacity,
         size_t slot_size);
 
+llama_expert_manager_ffi * llama_expert_manager_new_with_layout(
+        size_t capacity,
+        size_t slot_size,
+        int32_t layout_kind,
+        const int32_t * layout_parts,
+        size_t part_count);
+
 llama_expert_handle_ffi * llama_expert_manager_ensure(
         llama_expert_manager_ffi * manager,
         int32_t layer,
@@ -122,9 +148,15 @@ uint8_t * llama_expert_handle_host_ptr(
         const llama_expert_handle_ffi * handle,
         int32_t part);
 
+uint8_t * llama_expert_handle_host_base_ptr(
+        const llama_expert_handle_ffi * handle);
+
 const uint8_t * llama_expert_handle_device_ptr(
         const llama_expert_handle_ffi * handle,
         int32_t part);
+
+const uint8_t * llama_expert_handle_device_base_ptr(
+        const llama_expert_handle_ffi * handle);
 
 size_t llama_expert_handle_part_size(
         const llama_expert_handle_ffi * handle,
@@ -253,17 +285,19 @@ public:
         return handle_ != nullptr;
     }
 
-    uint8_t * host_ptr(MoePart part) const {
-        return llama_expert_handle_host_ptr(handle_, static_cast<int32_t>(part));
+    uint8_t * host_ptr(MoePart part) const;
+
+    uint8_t * host_base_ptr() const {
+        return llama_expert_handle_host_base_ptr(handle_);
     }
 
-    const uint8_t * device_ptr(MoePart part) const {
-        return llama_expert_handle_device_ptr(handle_, static_cast<int32_t>(part));
+    const uint8_t * device_ptr(MoePart part) const;
+
+    const uint8_t * device_base_ptr() const {
+        return llama_expert_handle_device_base_ptr(handle_);
     }
 
-    size_t part_size(MoePart part) const {
-        return llama_expert_handle_part_size(handle_, static_cast<int32_t>(part));
-    }
+    size_t part_size(MoePart part) const;
 
     int32_t slot_id() const {
         return llama_expert_handle_slot_id(handle_);
@@ -274,6 +308,8 @@ public:
 private:
     ExpertManager * manager_ = nullptr;
     llama_expert_handle_ffi * handle_ = nullptr;
+
+    friend class ExpertManager;
 };
 
 class ExpertManager {
@@ -301,9 +337,25 @@ public:
     static ExpertManager create_with_slot_size(
             size_t capacity,
             size_t slot_size) {
-        llama_expert_manager_ffi * impl = llama_expert_manager_new_with_slot_size(
+        return create_with_layout(capacity, slot_size, TensorLayout{});
+    }
+
+    static ExpertManager create_with_layout(
+            size_t capacity,
+            size_t slot_size,
+            const TensorLayout & layout) {
+        std::vector<int32_t> parts;
+        parts.reserve(layout.parts.size());
+        for (MoePart part : layout.parts) {
+            parts.push_back(static_cast<int32_t>(part));
+        }
+
+        llama_expert_manager_ffi * impl = llama_expert_manager_new_with_layout(
                 capacity,
-                slot_size);
+                slot_size,
+                static_cast<int32_t>(layout.kind),
+                parts.data(),
+                parts.size());
         if (impl == nullptr) {
             const char * err = llama_expert_manager_last_error_message();
             if (err != nullptr && err[0] != '\0') {
@@ -311,11 +363,14 @@ public:
             }
             throw std::runtime_error("failed to create MoE expert manager: Rust FFI is not linked or returned null without an error");
         }
-        return ExpertManager(impl, true);
+        return ExpertManager(impl, true, layout);
     }
 
-    explicit ExpertManager(llama_expert_manager_ffi * impl, bool owns_impl = false)
-        : impl_(impl), owns_impl_(owns_impl) {
+    explicit ExpertManager(
+            llama_expert_manager_ffi * impl,
+            bool owns_impl = false,
+            TensorLayout layout = TensorLayout{})
+        : impl_(impl), owns_impl_(owns_impl), layout_(std::move(layout)) {
         if (impl_ == nullptr) {
             throw std::invalid_argument("ExpertManager requires a non-null Rust manager");
         }
@@ -327,6 +382,7 @@ public:
     ExpertManager(ExpertManager && other) noexcept {
         impl_ = other.impl_;
         owns_impl_ = other.owns_impl_;
+        layout_ = std::move(other.layout_);
         other.impl_ = nullptr;
         other.owns_impl_ = false;
     }
@@ -336,6 +392,7 @@ public:
             close();
             impl_ = other.impl_;
             owns_impl_ = other.owns_impl_;
+            layout_ = std::move(other.layout_);
             other.impl_ = nullptr;
             other.owns_impl_ = false;
         }
@@ -348,6 +405,49 @@ public:
 
     llama_expert_manager_ffi * get() const {
         return impl_;
+    }
+
+    const TensorLayout & layout() const {
+        return layout_;
+    }
+
+    const TensorLayoutEntry * layout_entry(MoePart part) const {
+        for (const TensorLayoutEntry & entry : layout_.entries) {
+            if (entry.part == part) {
+                return &entry;
+            }
+        }
+        return nullptr;
+    }
+
+    uint8_t * handle_host_ptr(const ExpertHandle & handle, MoePart part) const {
+        const TensorLayoutEntry * entry = layout_entry(part);
+        if (entry != nullptr) {
+            uint8_t * base = handle.host_base_ptr();
+            if (base != nullptr) {
+                return base + entry->offset;
+            }
+        }
+        return llama_expert_handle_host_ptr(handle.handle_, static_cast<int32_t>(part));
+    }
+
+    const uint8_t * handle_device_ptr(const ExpertHandle & handle, MoePart part) const {
+        const TensorLayoutEntry * entry = layout_entry(part);
+        if (entry != nullptr) {
+            const uint8_t * base = handle.device_base_ptr();
+            if (base != nullptr) {
+                return base + entry->offset;
+            }
+        }
+        return llama_expert_handle_device_ptr(handle.handle_, static_cast<int32_t>(part));
+    }
+
+    size_t handle_part_size(const ExpertHandle & handle, MoePart part) const {
+        const TensorLayoutEntry * entry = layout_entry(part);
+        if (entry != nullptr) {
+            return entry->size;
+        }
+        return llama_expert_handle_part_size(handle.handle_, static_cast<int32_t>(part));
     }
 
     ExpertHandle ensure(int32_t layer, int32_t expert) {
@@ -535,9 +635,32 @@ private:
 
     llama_expert_manager_ffi * impl_ = nullptr;
     bool owns_impl_ = false;
+    TensorLayout layout_;
 
     friend class ExpertTicket;
+    friend class ExpertHandle;
 };
+
+inline uint8_t * ExpertHandle::host_ptr(MoePart part) const {
+    if (manager_ != nullptr && handle_ != nullptr) {
+        return manager_->handle_host_ptr(*this, part);
+    }
+    return nullptr;
+}
+
+inline const uint8_t * ExpertHandle::device_ptr(MoePart part) const {
+    if (manager_ != nullptr && handle_ != nullptr) {
+        return manager_->handle_device_ptr(*this, part);
+    }
+    return nullptr;
+}
+
+inline size_t ExpertHandle::part_size(MoePart part) const {
+    if (manager_ != nullptr && handle_ != nullptr) {
+        return manager_->handle_part_size(*this, part);
+    }
+    return 0;
+}
 
 inline void ExpertHandle::reset() {
     if (manager_ != nullptr && handle_ != nullptr) {
