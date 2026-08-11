@@ -21,7 +21,9 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cfloat>
 #include <cstdlib>
 #include <cstdint>
@@ -157,6 +159,11 @@ __attribute__((weak)) int32_t llama_expert_handle_slot_id(
     return -1;
 }
 
+__attribute__((weak)) uint64_t llama_expert_handle_generation(
+        const llama_expert_handle_ffi *) {
+    return 0;
+}
+
 __attribute__((weak)) int32_t llama_expert_manager_register_slice(
         llama_expert_manager_ffi *,
         int32_t,
@@ -190,6 +197,112 @@ __attribute__((weak)) int32_t llama_expert_manager_stats(
 #endif
 
 namespace {
+
+struct llama_moe_gate_trace_event {
+    uint64_t sequence = 0;
+    uint64_t timestamp_ns = 0;
+    int32_t layer = -1;
+    int32_t expert = -1;
+    int32_t part = -1;
+    int32_t slot = -1;
+    uint64_t generation = 0;
+    std::string kind;
+    std::vector<int32_t> experts;
+};
+
+class llama_moe_gate_trace {
+public:
+    llama_moe_gate_trace() {
+        const char * path = std::getenv("LLAMA_MOE_GATE_TRACE_JSONL");
+        if (path != nullptr && path[0] != '\0') {
+            path_ = path;
+        }
+    }
+
+    ~llama_moe_gate_trace() {
+        if (path_.empty()) {
+            return;
+        }
+
+        std::ofstream output(path_, std::ios::out | std::ios::trunc);
+        if (!output) {
+            LLAMA_LOG_ERROR("%s: failed to open MoE Gate A trace: %s\n", __func__, path_.c_str());
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto & event : events_) {
+            output << "{\"event\":\"" << event.kind
+                   << "\",\"sequence\":" << event.sequence
+                   << ",\"timestamp_ns\":" << event.timestamp_ns
+                   << ",\"layer_id\":" << event.layer;
+            if (event.expert >= 0) {
+                output << ",\"logical_expert_id\":" << event.expert
+                       << ",\"physical_slot\":" << event.slot
+                       << ",\"slot_generation\":" << event.generation
+                       << ",\"part\":" << event.part;
+            }
+            if (!event.experts.empty()) {
+                output << ",\"experts\":[";
+                for (size_t i = 0; i < event.experts.size(); ++i) {
+                    if (i > 0) {
+                        output << ',';
+                    }
+                    output << event.experts[i];
+                }
+                output << ']';
+            }
+            output << "}\n";
+        }
+    }
+
+    void record_route(int32_t layer, const std::vector<int32_t> & experts) {
+        if (path_.empty()) {
+            return;
+        }
+        llama_moe_gate_trace_event event;
+        event.sequence = sequence_.fetch_add(1, std::memory_order_relaxed);
+        event.timestamp_ns = now_ns();
+        event.layer = layer;
+        event.kind = "router_selection";
+        event.experts = experts;
+        std::lock_guard<std::mutex> lock(mutex_);
+        events_.push_back(std::move(event));
+    }
+
+    void record_slot(int32_t layer, int32_t expert, MoePart part, const ExpertHandle & handle) {
+        if (path_.empty()) {
+            return;
+        }
+        llama_moe_gate_trace_event event;
+        event.sequence = sequence_.fetch_add(1, std::memory_order_relaxed);
+        event.timestamp_ns = now_ns();
+        event.layer = layer;
+        event.expert = expert;
+        event.part = static_cast<int32_t>(part);
+        event.slot = handle.slot_id();
+        event.generation = handle.generation();
+        event.kind = "expert_slot_ready";
+        std::lock_guard<std::mutex> lock(mutex_);
+        events_.push_back(std::move(event));
+    }
+
+private:
+    static uint64_t now_ns() {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+    std::string path_;
+    std::atomic<uint64_t> sequence_{0};
+    std::mutex mutex_;
+    std::vector<llama_moe_gate_trace_event> events_;
+};
+
+llama_moe_gate_trace & llama_moe_gate_trace_instance() {
+    static llama_moe_gate_trace trace;
+    return trace;
+}
 
 struct llama_moe_tensor_meta {
     ExpertManager * manager = nullptr;
@@ -252,6 +365,7 @@ struct llama_moe_expert_shared_state {
             }
 
             ExpertHandle handle = ticket.get_handle(layer, expert);
+            llama_moe_gate_trace_instance().record_slot(layer, expert, part, handle);
             auto [it, inserted] = handles.emplace(expert, std::move(handle));
             (void) inserted;
 
@@ -294,6 +408,7 @@ struct llama_moe_expert_shared_state {
             }
 
             ExpertHandle handle = ticket.get_handle(layer, expert);
+            llama_moe_gate_trace_instance().record_slot(layer, expert, part, handle);
             auto [it, inserted] = handles.emplace(expert, std::move(handle));
             (void) inserted;
 
@@ -330,6 +445,7 @@ struct llama_moe_expert_shared_state {
 
             auto ready = ticket.wait_any_ready(layer, experts, static_cast<size_t>(count));
             const int32_t expert = ready.first;
+            llama_moe_gate_trace_instance().record_slot(layer, expert, part, ready.second);
             auto [it, inserted] = handles.emplace(expert, std::move(ready.second));
             (void) inserted;
 
@@ -409,6 +525,11 @@ size_t llama_linux_mem_available_bytes() {
     return 0;
 }
 
+bool llama_linux_is_jetson() {
+    std::ifstream release("/etc/nv_tegra_release");
+    return release.good();
+}
+
 void * llama_moe_expert_ensure_callback(void *, const ggml_tensor * src0, const ggml_tensor * ids) {
     llama_moe_tensor_meta meta;
     {
@@ -461,6 +582,7 @@ void * llama_moe_expert_ensure_callback(void *, const ggml_tensor * src0, const 
         }
     }
 
+    llama_moe_gate_trace_instance().record_route(meta.layer, active_experts);
     std::vector<ExpertKey> experts;
     experts.reserve(active_experts.size());
     for (const int32_t expert : active_experts) {
@@ -8610,7 +8732,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             slot_size));
                 }
 
-                size_t effective_capacity = params.expert_cache_capacity;
+                // A batched prefill can route tokens to every expert in one MoE layer.
+                // Those handles are live together until that layer's operation completes,
+                // so a smaller pool can deadlock eviction with every slot referenced.
+                const size_t minimum_safe_capacity = static_cast<size_t>(hparams.n_expert);
+                size_t effective_capacity = std::max(params.expert_cache_capacity, minimum_safe_capacity);
+                if (params.expert_cache_capacity < minimum_safe_capacity) {
+                    LLAMA_LOG_WARN(
+                            "%s: increasing MoE expert cache capacity from %zu to minimum safe capacity %zu for batched prefill\n",
+                            __func__, params.expert_cache_capacity, minimum_safe_capacity);
+                }
                 const size_t host_reserve_bytes   = llama_expert_cache_env_mib("LLAMA_EXPERT_CACHE_HOST_RESERVE_MIB",   2048) * 1048576ull;
                 const size_t device_reserve_bytes = llama_expert_cache_env_mib("LLAMA_EXPERT_CACHE_DEVICE_RESERVE_MIB", 1024) * 1048576ull;
 
@@ -8628,7 +8759,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                 size_t max_capacity_by_device = SIZE_MAX;
                 const auto planned_device_bytes = estimate_device_model_allocation_bytes();
+                size_t planned_device_total = 0;
+                size_t minimum_device_free = SIZE_MAX;
                 for (const auto & [dev, planned_bytes] : planned_device_bytes) {
+                    planned_device_total += planned_bytes;
                     size_t free_bytes = 0;
                     size_t total_bytes = 0;
                     ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
@@ -8641,6 +8775,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     if (free_bytes == 0) {
                         continue;
                     }
+                    minimum_device_free = std::min(minimum_device_free, free_bytes);
+
                     size_t this_max = 0;
                     if (free_bytes > planned_bytes + device_reserve_bytes) {
                         this_max = (free_bytes - planned_bytes - device_reserve_bytes) / slot_size;
@@ -8651,18 +8787,47 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     effective_capacity = std::min(effective_capacity, max_capacity_by_device);
                 }
 
+                size_t max_capacity_by_unified = SIZE_MAX;
+                if (llama_linux_is_jetson()) {
+                    size_t unified_available = mem_available;
+                    if (minimum_device_free != SIZE_MAX) {
+                        unified_available = unified_available == 0
+                            ? minimum_device_free
+                            : std::min(unified_available, minimum_device_free);
+                    }
+                    const size_t planned_bytes = planned_host_bytes + planned_device_total;
+                    const size_t reserve_bytes = host_reserve_bytes + device_reserve_bytes;
+                    if (unified_available > planned_bytes &&
+                        unified_available - planned_bytes > reserve_bytes) {
+                        max_capacity_by_unified =
+                            (unified_available - planned_bytes - reserve_bytes) / slot_size;
+                    } else {
+                        max_capacity_by_unified = 0;
+                    }
+                    effective_capacity = std::min(effective_capacity, max_capacity_by_unified);
+                }
+
                 if (effective_capacity < params.expert_cache_capacity) {
                     LLAMA_LOG_WARN(
                             "%s: reducing MoE expert cache capacity from %zu to %zu to fit memory budget "
-                            "(slot_size=%.2f MiB, host_max=%s, device_max=%s, reserves: host=%zu MiB, device=%zu MiB)\n",
+                            "(slot_size=%.2f MiB, host_max=%s, device_max=%s, unified_max=%s, reserves: host=%zu MiB, device=%zu MiB)\n",
                             __func__,
                             params.expert_cache_capacity,
                             effective_capacity,
                             slot_size / 1048576.0,
                             max_capacity_by_host == SIZE_MAX ? "unknown" : std::to_string(max_capacity_by_host).c_str(),
                             max_capacity_by_device == SIZE_MAX ? "unknown" : std::to_string(max_capacity_by_device).c_str(),
+                            max_capacity_by_unified == SIZE_MAX ? "n/a" : std::to_string(max_capacity_by_unified).c_str(),
                             host_reserve_bytes / 1048576,
                             device_reserve_bytes / 1048576);
+                }
+
+                if (effective_capacity < minimum_safe_capacity) {
+                    throw std::runtime_error(format(
+                            "MoE expert cache memory budget permits %zu slots, but batched prefill requires at least %zu "
+                            "(one slot per routed expert); reduce model/context memory or cache reserves",
+                            effective_capacity,
+                            minimum_safe_capacity));
                 }
 
                 if (effective_capacity == 0) {

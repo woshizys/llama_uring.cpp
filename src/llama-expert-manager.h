@@ -165,6 +165,9 @@ size_t llama_expert_handle_part_size(
 int32_t llama_expert_handle_slot_id(
         const llama_expert_handle_ffi * handle);
 
+uint64_t llama_expert_handle_generation(
+        const llama_expert_handle_ffi * handle);
+
 int32_t llama_expert_manager_register_slice(
         llama_expert_manager_ffi * manager,
         int32_t layer,
@@ -301,6 +304,10 @@ public:
 
     int32_t slot_id() const {
         return llama_expert_handle_slot_id(handle_);
+    }
+
+    uint64_t generation() const {
+        return llama_expert_handle_generation(handle_);
     }
 
     void reset();

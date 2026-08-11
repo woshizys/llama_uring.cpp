@@ -9,5 +9,5 @@ name = "llama_expert_cache_ffi"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
-io-scheduler = { path = "../../../InterfaceIO/io-scheduler" }
+io-scheduler = { path = "../../../InterfaceIO/io-scheduler", default-features = false }
 tokio = { version = "1.0", features = ["rt-multi-thread"] }

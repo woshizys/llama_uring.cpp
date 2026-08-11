@@ -7,7 +7,7 @@ use io_scheduler::expert_manager::{
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
 use tokio::runtime::{Builder, Handle, Runtime};
@@ -948,6 +948,28 @@ pub extern "C" fn llama_expert_handle_slot_id(handle: *const llama_expert_handle
         Err(_) => {
             set_last_error(ExpertCacheError::Panic);
             -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn llama_expert_handle_generation(handle: *const llama_expert_handle_ffi) -> u64 {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let handle = handle_ref(handle)?;
+        Ok(scheduler_handle_ref(handle).generation())
+    }));
+
+    match result {
+        Ok(Ok(generation)) => generation,
+        Ok(Err(error)) => {
+            set_last_error(error);
+            0
+        }
+        Err(_) => {
+            set_last_error(ExpertCacheError::Panic);
+            0
         }
     }
 }

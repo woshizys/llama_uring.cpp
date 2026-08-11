@@ -1,0 +1,10 @@
+{
+  "distinct_logical_experts": 1510,
+  "events": 46383,
+  "layers": 26,
+  "physical_slots": 63,
+  "router_events": 6318,
+  "slot_ready_events": 40065,
+  "slot_reuses": 13292,
+  "valid": true
+}
