@@ -23,9 +23,11 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -379,6 +381,32 @@ std::unordered_map<
             std::weak_ptr<llama_moe_expert_shared_state>,
             llama_moe_expert_shared_key_hash> cache;
     return cache;
+}
+
+size_t llama_expert_cache_env_mib(const char * name, size_t fallback_mib) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback_mib;
+    }
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value) {
+        return fallback_mib;
+    }
+    return static_cast<size_t>(parsed);
+}
+
+size_t llama_linux_mem_available_bytes() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    size_t value_kib = 0;
+    std::string unit;
+    while (meminfo >> key >> value_kib >> unit) {
+        if (key == "MemAvailable:") {
+            return value_kib * 1024;
+        }
+    }
+    return 0;
 }
 
 void * llama_moe_expert_ensure_callback(void *, const ggml_tensor * src0, const ggml_tensor * ids) {
@@ -8421,8 +8449,55 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         return tensor != nullptr && ml.weights_map.find(ggml_get_name(tensor)) != ml.weights_map.end();
     };
 
+    std::unordered_map<const ggml_tensor *, ggml_backend_buffer_type_t> tensor_bufts;
+    for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+        for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
+            tensor_bufts[cur] = buft;
+        }
+    }
+
+    auto tensor_uses_cpu_buft = [&](ggml_tensor * tensor) {
+        auto it = tensor_bufts.find(tensor);
+        if (it == tensor_bufts.end()) {
+            return false;
+        }
+        return ggml_backend_buft_is_host(it->second);
+    };
+
     auto is_expert_cache_moe_tensor = [&](ggml_tensor * tensor) {
-        return has_gguf_weight(tensor);
+        return has_gguf_weight(tensor) && tensor_uses_cpu_buft(tensor);
+    };
+
+    auto estimate_model_allocation_bytes = [&](bool host_resident) {
+        size_t total = 0;
+        for (const auto & [tensor, buft] : tensor_bufts) {
+            if (is_expert_cache_moe_tensor(const_cast<ggml_tensor *>(tensor))) {
+                continue;
+            }
+            if (ggml_backend_buft_is_host(buft) != host_resident) {
+                continue;
+            }
+            total += ggml_backend_buft_get_alloc_size(buft, tensor);
+        }
+        return total;
+    };
+
+    auto estimate_device_model_allocation_bytes = [&]() {
+        std::unordered_map<ggml_backend_dev_t, size_t> by_device;
+        for (const auto & [tensor, buft] : tensor_bufts) {
+            if (is_expert_cache_moe_tensor(const_cast<ggml_tensor *>(tensor))) {
+                continue;
+            }
+            if (ggml_backend_buft_is_host(buft)) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev == nullptr) {
+                continue;
+            }
+            by_device[dev] += ggml_backend_buft_get_alloc_size(buft, tensor);
+        }
+        return by_device;
     };
 
     if (!expert_manager && params.expert_cache_capacity > 0) {
@@ -8440,6 +8515,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             std::vector<bool> layout_part_seen(expert_cache_layout.parts.size(), false);
             std::vector<bool> expected_presence;
             bool have_expected_presence = false;
+            bool consistent_presence = true;
 
             auto tensor_for_part = [](llama_layer & layer, MoePart part) -> ggml_tensor * {
                 switch (part) {
@@ -8496,7 +8572,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         expected_presence = layer_presence;
                         have_expected_presence = true;
                     } else if (layer_presence != expected_presence) {
-                        throw std::runtime_error("MoE expert cache requires a consistent expert tensor layout across layers");
+                        consistent_presence = false;
                     }
                 }
                 slot_size = std::max(slot_size, layer_slot_size);
@@ -8512,35 +8588,101 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     }
                     const size_t tensor_size = layout_part_sizes[part_index];
                     const size_t part_slot_size = layout_part_slot_size(tensor_size);
-                    expert_cache_layout.entries.push_back({
-                            expert_cache_layout.parts[part_index],
-                            layout_offset,
-                            tensor_size,
-                            part_slot_size,
-                    });
+                    if (consistent_presence) {
+                        expert_cache_layout.entries.push_back({
+                                expert_cache_layout.parts[part_index],
+                                layout_offset,
+                                tensor_size,
+                                part_slot_size,
+                        });
+                    }
                     layout_offset += part_slot_size;
                 }
-                expert_cache_layout.slot_size = layout_offset;
-                if (expert_cache_layout.slot_size != slot_size) {
+                expert_cache_layout.slot_size = slot_size;
+                if (!consistent_presence) {
+                    LLAMA_LOG_INFO(
+                            "%s: MoE expert cache uses mixed tensor layout across layers; disabling fixed part offsets and using per-expert metadata\n",
+                            __func__);
+                } else if (layout_offset != slot_size) {
                     throw std::runtime_error(format(
                             "MoE expert cache layout slot size mismatch: layout=%zu, computed=%zu",
-                            expert_cache_layout.slot_size,
+                            layout_offset,
                             slot_size));
                 }
 
-                expert_manager = std::make_unique<ExpertManager>(ExpertManager::create_with_layout(
-                        params.expert_cache_capacity,
+                size_t effective_capacity = params.expert_cache_capacity;
+                const size_t host_reserve_bytes   = llama_expert_cache_env_mib("LLAMA_EXPERT_CACHE_HOST_RESERVE_MIB",   2048) * 1048576ull;
+                const size_t device_reserve_bytes = llama_expert_cache_env_mib("LLAMA_EXPERT_CACHE_DEVICE_RESERVE_MIB", 1024) * 1048576ull;
+
+                size_t max_capacity_by_host = SIZE_MAX;
+                const size_t planned_host_bytes = estimate_model_allocation_bytes(/*host_resident=*/true);
+                const size_t mem_available = llama_linux_mem_available_bytes();
+                if (mem_available > 0) {
+                    if (mem_available > planned_host_bytes + host_reserve_bytes) {
+                        max_capacity_by_host = (mem_available - planned_host_bytes - host_reserve_bytes) / slot_size;
+                    } else {
+                        max_capacity_by_host = 0;
+                    }
+                    effective_capacity = std::min(effective_capacity, max_capacity_by_host);
+                }
+
+                size_t max_capacity_by_device = SIZE_MAX;
+                const auto planned_device_bytes = estimate_device_model_allocation_bytes();
+                for (const auto & [dev, planned_bytes] : planned_device_bytes) {
+                    size_t free_bytes = 0;
+                    size_t total_bytes = 0;
+                    ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+                    if (free_bytes == 0 && total_bytes == 0) {
+                        ggml_backend_dev_props props;
+                        ggml_backend_dev_get_props(dev, &props);
+                        free_bytes = props.memory_free;
+                        total_bytes = props.memory_total;
+                    }
+                    if (free_bytes == 0) {
+                        continue;
+                    }
+                    size_t this_max = 0;
+                    if (free_bytes > planned_bytes + device_reserve_bytes) {
+                        this_max = (free_bytes - planned_bytes - device_reserve_bytes) / slot_size;
+                    }
+                    max_capacity_by_device = std::min(max_capacity_by_device, this_max);
+                }
+                if (max_capacity_by_device != SIZE_MAX) {
+                    effective_capacity = std::min(effective_capacity, max_capacity_by_device);
+                }
+
+                if (effective_capacity < params.expert_cache_capacity) {
+                    LLAMA_LOG_WARN(
+                            "%s: reducing MoE expert cache capacity from %zu to %zu to fit memory budget "
+                            "(slot_size=%.2f MiB, host_max=%s, device_max=%s, reserves: host=%zu MiB, device=%zu MiB)\n",
+                            __func__,
+                            params.expert_cache_capacity,
+                            effective_capacity,
+                            slot_size / 1048576.0,
+                            max_capacity_by_host == SIZE_MAX ? "unknown" : std::to_string(max_capacity_by_host).c_str(),
+                            max_capacity_by_device == SIZE_MAX ? "unknown" : std::to_string(max_capacity_by_device).c_str(),
+                            host_reserve_bytes / 1048576,
+                            device_reserve_bytes / 1048576);
+                }
+
+                if (effective_capacity == 0) {
+                    LLAMA_LOG_WARN("%s: MoE expert cache disabled because no memory budget remains after model allocation estimate\n", __func__);
+                } else {
+                    expert_manager = std::make_unique<ExpertManager>(ExpertManager::create_with_layout(
+                        effective_capacity,
                         slot_size,
                         expert_cache_layout));
-                llama_moe_expert_install_callback();
-                LLAMA_LOG_INFO(
-                        "%s: auto-created MoE expert cache: capacity=%zu, slot_size=%.2f MiB, total_cache=%.2f MiB, registered_moe_tensors=%zu, layout=%s\n",
-                        __func__,
-                        params.expert_cache_capacity,
-                        slot_size / 1048576.0,
-                        (params.expert_cache_capacity * slot_size) / 1048576.0,
-                        registered_tensor_count,
-                        expert_cache_layout.kind == TensorLayoutKind::NonContiguous ? "non-contiguous" : "contiguous");
+                    llama_moe_expert_install_callback();
+                    LLAMA_LOG_INFO(
+                            "%s: auto-created MoE expert cache: requested_capacity=%zu, capacity=%zu, slot_size=%.2f MiB, total_cache=%.2f MiB, registered_moe_tensors=%zu, layout=%s\n",
+                            __func__,
+                            params.expert_cache_capacity,
+                            effective_capacity,
+                            slot_size / 1048576.0,
+                            (effective_capacity * slot_size) / 1048576.0,
+                            registered_tensor_count,
+                            expert_cache_layout.kind == TensorLayoutKind::NonContiguous ? "non-contiguous" : "contiguous");
+                }
             }
         }
     }

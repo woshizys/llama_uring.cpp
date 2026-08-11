@@ -67,11 +67,13 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <cstring>
 #include <deque>
 #include <initializer_list>
 #include <limits>
@@ -87,6 +89,138 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+struct ggml_cuda_moe_stats {
+    std::atomic<uint64_t> mul_mat_id_ops{0};
+    std::atomic<uint64_t> native_ops{0};
+    std::atomic<uint64_t> external_ops{0};
+
+    std::atomic<uint64_t> ids_cache_hits{0};
+    std::atomic<uint64_t> ids_cache_misses{0};
+    std::atomic<uint64_t> ids_d2h_calls{0};
+    std::atomic<uint64_t> ids_d2h_bytes{0};
+    std::atomic<uint64_t> ids_d2h_sync_ns{0};
+
+    std::atomic<uint64_t> ensure_calls{0};
+    std::atomic<uint64_t> ensure_ns{0};
+    std::atomic<uint64_t> active_experts_total{0};
+    std::atomic<uint64_t> active_experts_max{0};
+
+    std::atomic<uint64_t> get_device_calls{0};
+    std::atomic<uint64_t> get_device_ns{0};
+
+    std::atomic<uint64_t> ptr_table_h2d_calls{0};
+    std::atomic<uint64_t> ptr_table_h2d_bytes{0};
+    std::atomic<uint64_t> ptr_table_h2d_enqueue_ns{0};
+
+    std::atomic<uint64_t> path_mmvq{0};
+    std::atomic<uint64_t> path_mmq{0};
+    std::atomic<uint64_t> path_fallback{0};
+    std::atomic<uint64_t> release_events{0};
+};
+
+static uint64_t ggml_cuda_moe_now_ns() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static bool ggml_cuda_moe_stats_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_MOE_CUDA_STATS");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static uint64_t ggml_cuda_moe_stats_interval() {
+    static const uint64_t interval = [] {
+        const char * env = std::getenv("LLAMA_MOE_CUDA_STATS_INTERVAL");
+        if (env == nullptr || env[0] == '\0') {
+            return uint64_t(0);
+        }
+        char * end = nullptr;
+        return (uint64_t) std::strtoull(env, &end, 10);
+    }();
+    return interval;
+}
+
+static ggml_cuda_moe_stats & ggml_cuda_moe_stats_instance() {
+    static ggml_cuda_moe_stats stats;
+    return stats;
+}
+
+static void ggml_cuda_moe_stats_update_max(std::atomic<uint64_t> & target, uint64_t value) {
+    uint64_t old = target.load(std::memory_order_relaxed);
+    while (old < value && !target.compare_exchange_weak(old, value, std::memory_order_relaxed)) {
+    }
+}
+
+static void ggml_cuda_moe_stats_print(const char * reason) {
+    if (!ggml_cuda_moe_stats_enabled()) {
+        return;
+    }
+
+    auto & s = ggml_cuda_moe_stats_instance();
+    const uint64_t external_ops = s.external_ops.load(std::memory_order_relaxed);
+    const uint64_t active_total = s.active_experts_total.load(std::memory_order_relaxed);
+    const double active_avg = external_ops > 0 ? double(active_total) / double(external_ops) : 0.0;
+
+    const double ids_mib = s.ids_d2h_bytes.load(std::memory_order_relaxed) / 1048576.0;
+    const double ptr_mib = s.ptr_table_h2d_bytes.load(std::memory_order_relaxed) / 1048576.0;
+    const double ids_ms = s.ids_d2h_sync_ns.load(std::memory_order_relaxed) / 1000000.0;
+    const double ensure_ms = s.ensure_ns.load(std::memory_order_relaxed) / 1000000.0;
+    const double get_device_ms = s.get_device_ns.load(std::memory_order_relaxed) / 1000000.0;
+    const double ptr_ms = s.ptr_table_h2d_enqueue_ns.load(std::memory_order_relaxed) / 1000000.0;
+
+    std::fprintf(
+            stderr,
+            "%s: CUDA MoE stats[%s]: mul_mat_id=%" PRIu64 " native=%" PRIu64 " external=%" PRIu64
+            " ids_cache_hit/miss=%" PRIu64 "/%" PRIu64 " ids_d2h=%" PRIu64 " %.3f MiB %.3f ms"
+            " ensure=%" PRIu64 " %.3f ms active_avg/max=%.2f/%" PRIu64
+            " get_device=%" PRIu64 " %.3f ms ptr_h2d=%" PRIu64 " %.3f MiB %.3f ms"
+            " paths(mmvq/mmq/fallback)=%" PRIu64 "/%" PRIu64 "/%" PRIu64 " release_events=%" PRIu64 "\n",
+            __func__, reason,
+            s.mul_mat_id_ops.load(std::memory_order_relaxed),
+            s.native_ops.load(std::memory_order_relaxed),
+            s.external_ops.load(std::memory_order_relaxed),
+            s.ids_cache_hits.load(std::memory_order_relaxed),
+            s.ids_cache_misses.load(std::memory_order_relaxed),
+            s.ids_d2h_calls.load(std::memory_order_relaxed),
+            ids_mib,
+            ids_ms,
+            s.ensure_calls.load(std::memory_order_relaxed),
+            ensure_ms,
+            active_avg,
+            s.active_experts_max.load(std::memory_order_relaxed),
+            s.get_device_calls.load(std::memory_order_relaxed),
+            get_device_ms,
+            s.ptr_table_h2d_calls.load(std::memory_order_relaxed),
+            ptr_mib,
+            ptr_ms,
+            s.path_mmvq.load(std::memory_order_relaxed),
+            s.path_mmq.load(std::memory_order_relaxed),
+            s.path_fallback.load(std::memory_order_relaxed),
+            s.release_events.load(std::memory_order_relaxed));
+}
+
+static void ggml_cuda_moe_stats_maybe_print() {
+    const uint64_t interval = ggml_cuda_moe_stats_interval();
+    if (interval == 0 || !ggml_cuda_moe_stats_enabled()) {
+        return;
+    }
+    const uint64_t external_ops = ggml_cuda_moe_stats_instance().external_ops.load(std::memory_order_relaxed);
+    if (external_ops > 0 && external_ops % interval == 0) {
+        ggml_cuda_moe_stats_print("interval");
+    }
+}
+
+struct ggml_cuda_moe_stats_reporter {
+    ~ggml_cuda_moe_stats_reporter() {
+        ggml_cuda_moe_stats_print("final");
+    }
+};
+
+static ggml_cuda_moe_stats_reporter g_ggml_cuda_moe_stats_reporter;
 
 struct ggml_cuda_moe_ids_cache_entry {
     size_t nbytes = 0;
@@ -190,6 +324,7 @@ static void ggml_cuda_moe_expert_release_after_stream(cudaStream_t stream, void 
     cudaEvent_t event = nullptr;
     CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventRecord(event, stream));
+    ggml_cuda_moe_stats_instance().release_events.fetch_add(1, std::memory_order_relaxed);
     ggml_cuda_moe_release_queue_instance().enqueue(event, handle);
 }
 
@@ -2601,6 +2736,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool use_external_moe = (src0->flags & GGML_TENSOR_FLAG_EXTERNAL) != 0;
     cudaStream_t stream = ctx.stream();
+    auto & moe_stats = ggml_cuda_moe_stats_instance();
+    moe_stats.mul_mat_id_ops.fetch_add(1, std::memory_order_relaxed);
+    if (use_external_moe) {
+        moe_stats.external_ops.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        moe_stats.native_ops.fetch_add(1, std::memory_order_relaxed);
+    }
 
     std::vector<char> ids_host;
     void * moe_expert_handle = nullptr;
@@ -2626,8 +2768,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         if (!ids_cache_hit) {
             ids_host.resize(ggml_nbytes(ids));
+            const uint64_t t0 = ggml_cuda_moe_now_ns();
             CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
+            const uint64_t t1 = ggml_cuda_moe_now_ns();
+            moe_stats.ids_cache_misses.fetch_add(1, std::memory_order_relaxed);
+            moe_stats.ids_d2h_calls.fetch_add(1, std::memory_order_relaxed);
+            moe_stats.ids_d2h_bytes.fetch_add(ggml_nbytes(ids), std::memory_order_relaxed);
+            moe_stats.ids_d2h_sync_ns.fetch_add(t1 - t0, std::memory_order_relaxed);
 
             ggml_cuda_moe_ids_cache_entry entry;
             entry.nbytes = ids_host.size();
@@ -2644,23 +2792,37 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (cache.size() > 4096) {
                 cache.clear();
             }
+        } else {
+            moe_stats.ids_cache_hits.fetch_add(1, std::memory_order_relaxed);
         }
 
         ggml_tensor ids_host_tensor = *ids;
         ids_host_tensor.data = ids_host.data();
+        const uint64_t ensure_t0 = ggml_cuda_moe_now_ns();
         moe_expert_handle = ggml_moe_expert_ensure(src0, &ids_host_tensor);
+        const uint64_t ensure_t1 = ggml_cuda_moe_now_ns();
+        moe_stats.ensure_calls.fetch_add(1, std::memory_order_relaxed);
+        moe_stats.ensure_ns.fetch_add(ensure_t1 - ensure_t0, std::memory_order_relaxed);
         GGML_ASSERT(moe_expert_handle != nullptr && "external CUDA MUL_MAT_ID requires MoE expert callback");
 
         std::vector<const void *> expert_ptrs_host(ne02, nullptr);
         std::vector<bool> active_expert(ne02, false);
+        uint64_t active_count = 0;
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int64_t id = 0; id < ids->ne[0]; ++id) {
                 const int32_t expert =
                     *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
                 GGML_ASSERT(expert >= 0 && expert < ne02);
-                active_expert[expert] = true;
+                if (!active_expert[expert]) {
+                    active_expert[expert] = true;
+                    active_count++;
+                }
             }
         }
+        moe_stats.active_experts_total.fetch_add(active_count, std::memory_order_relaxed);
+        ggml_cuda_moe_stats_update_max(moe_stats.active_experts_max, active_count);
+
+        const uint64_t get_device_t0 = ggml_cuda_moe_now_ns();
         for (int64_t expert = 0; expert < ne02; ++expert) {
             if (!active_expert[expert]) {
                 continue;
@@ -2668,8 +2830,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             expert_ptrs_host[expert] = ggml_moe_expert_get_device_data(moe_expert_handle, expert, nullptr);
             GGML_ASSERT(expert_ptrs_host[expert] != nullptr && "external CUDA MUL_MAT_ID active expert has no device pointer");
         }
+        const uint64_t get_device_t1 = ggml_cuda_moe_now_ns();
+        moe_stats.get_device_calls.fetch_add(active_count, std::memory_order_relaxed);
+        moe_stats.get_device_ns.fetch_add(get_device_t1 - get_device_t0, std::memory_order_relaxed);
+
         moe_expert_ptrs_dev.alloc(ne02);
+        const uint64_t ptr_t0 = ggml_cuda_moe_now_ns();
         CUDA_CHECK(cudaMemcpyAsync(moe_expert_ptrs_dev.ptr, expert_ptrs_host.data(), ne02*sizeof(const void *), cudaMemcpyHostToDevice, stream));
+        const uint64_t ptr_t1 = ggml_cuda_moe_now_ns();
+        moe_stats.ptr_table_h2d_calls.fetch_add(1, std::memory_order_relaxed);
+        moe_stats.ptr_table_h2d_bytes.fetch_add(ne02*sizeof(const void *), std::memory_order_relaxed);
+        moe_stats.ptr_table_h2d_enqueue_ns.fetch_add(ptr_t1 - ptr_t0, std::memory_order_relaxed);
         moe_expert_ptrs = moe_expert_ptrs_dev.ptr;
     }
 
@@ -2683,6 +2854,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst, nullptr, moe_expert_ptrs);
                     if (moe_expert_handle != nullptr) {
                         ggml_cuda_moe_expert_release_after_stream(stream, moe_expert_handle);
+                        moe_stats.path_mmvq.fetch_add(1, std::memory_order_relaxed);
+                        ggml_cuda_moe_stats_maybe_print();
                     }
                     return;
                 }
@@ -2698,6 +2871,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst, moe_expert_ptrs);
             if (moe_expert_handle != nullptr) {
                 ggml_cuda_moe_expert_release_after_stream(stream, moe_expert_handle);
+                moe_stats.path_mmq.fetch_add(1, std::memory_order_relaxed);
+                ggml_cuda_moe_stats_maybe_print();
             }
             return;
         }
@@ -2709,6 +2884,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     // note: this path should not be reached when recording CUDA graphs, because it requires CPU-side routing and IO scheduling
+    if (moe_expert_handle != nullptr) {
+        moe_stats.path_fallback.fetch_add(1, std::memory_order_relaxed);
+    }
 
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
@@ -2828,6 +3006,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (moe_expert_handle != nullptr) {
         ggml_cuda_moe_expert_release_after_stream(stream, moe_expert_handle);
+        ggml_cuda_moe_stats_maybe_print();
     }
 }
 
