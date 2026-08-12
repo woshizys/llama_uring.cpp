@@ -93,6 +93,16 @@ fn predictor_from_env() -> Result<Box<dyn ExpertPredictor>, ExpertCacheError> {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(256);
+    if let Some(path) = std::env::var_os("PDCAT_PREDICTOR_TRACE") {
+        let predictor = TraceBasedPredictor::from_jsonl_file_exact(&path, top_k)
+            .map_err(|error| ExpertCacheError::Backend(error.to_string()))?;
+        eprintln!(
+            "[PDCAT][predictor-load] backend=trace-oracle trace={} top_k={}",
+            std::path::Path::new(&path).display(),
+            top_k,
+        );
+        return Ok(Box::new(predictor));
+    }
     if let Some(path) = std::env::var_os("PDCAT_PREDICTOR_MANIFEST") {
         let predictor = LowRankMlpPredictor::from_manifest(&path, top_k)
             .map_err(|error| ExpertCacheError::Backend(error.to_string()))?;
@@ -788,6 +798,16 @@ pub extern "C" fn llama_expert_manager_prefetch_next_layer_mandatory(
 /// Observes the native router output, predicts the next registered MoE layer,
 /// and admits every returned candidate as speculative prefetch. Prediction never
 /// changes the native router selection.
+fn predictor_phase(value: i32) -> Result<&'static str, ExpertCacheError> {
+    match value {
+        1 => Ok("prefill"),
+        0 => Ok("decode"),
+        value => Err(ExpertCacheError::Backend(format!(
+            "invalid predictor phase {value}; expected 0=decode or 1=prefill"
+        ))),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn llama_expert_manager_predict_prefetch_next(
     manager: *mut llama_expert_manager_ffi,
@@ -798,6 +818,7 @@ pub extern "C" fn llama_expert_manager_predict_prefetch_next(
     max_predictions: usize,
     current_token_id: u64,
     deadline_ns: u64,
+    phase: i32,
     predictions_out: *mut llama_expert_prediction_ffi,
     predictions_capacity: usize,
 ) -> i32 {
@@ -814,6 +835,7 @@ pub extern "C" fn llama_expert_manager_predict_prefetch_next(
         if max_predictions == 0 || predictions_capacity == 0 {
             return Ok(0);
         }
+        let phase = predictor_phase(phase)?;
 
         let layer = id_to_usize("layer", layer)?;
         manager.manager.set_metric_token_id(current_token_id);
@@ -868,11 +890,17 @@ pub extern "C" fn llama_expert_manager_predict_prefetch_next(
                 ExpertCacheError::Backend("online predictor mutex is poisoned".to_string())
             })?;
             predictor
-                .observe(Some("online"), layer, &current_experts)
+                .observe_at(
+                    Some("online"),
+                    Some(current_token_id),
+                    layer,
+                    &current_experts,
+                )
                 .map_err(scheduler_error)?;
             predictor
                 .predict_next(&PredictionRequest {
                     request_id: Some("online".to_string()),
+                    token_id: Some(current_token_id),
                     current_layer: layer,
                     target_layer: Some(next_layer),
                     current_experts,
@@ -913,6 +941,7 @@ pub extern "C" fn llama_expert_manager_predict_prefetch_next(
                 deadline_ns,
                 predictor_us,
                 target_token_id,
+                phase,
             ))
             .map_err(scheduler_error)?;
 
@@ -958,6 +987,7 @@ pub extern "C" fn llama_expert_manager_submit_batch_async(
     experts: *const i32,
     count: usize,
     token_id: u64,
+    phase: i32,
 ) -> *mut llama_expert_ticket_ffi {
     clear_last_error();
 
@@ -968,6 +998,7 @@ pub extern "C" fn llama_expert_manager_submit_batch_async(
         }
 
         let layer = id_to_usize("layer", layer)?;
+        let phase = predictor_phase(phase)?;
         let expert_ids = if count == 0 {
             &[][..]
         } else {
@@ -981,11 +1012,11 @@ pub extern "C" fn llama_expert_manager_submit_batch_async(
 
         let ticket = manager
             .runtime
-            .block_on(
-                manager
-                    .manager
-                    .submit_batch_async(keys, (token_id != u64::MAX).then_some(token_id)),
-            )
+            .block_on(manager.manager.submit_batch_async(
+                keys,
+                (token_id != u64::MAX).then_some(token_id),
+                Some(phase),
+            ))
             .map_err(scheduler_error)?;
 
         Ok(llama_expert_ticket_ffi {
@@ -1444,5 +1475,12 @@ mod tests {
         };
 
         assert!(tensor_meta_from_ffi(0, 0, raw).is_err());
+    }
+
+    #[test]
+    fn predictor_phase_is_explicit_and_validated() {
+        assert_eq!(predictor_phase(1).unwrap(), "prefill");
+        assert_eq!(predictor_phase(0).unwrap(), "decode");
+        assert!(predictor_phase(2).is_err());
     }
 }

@@ -83,12 +83,88 @@ The DeepSeek config exposes these principal profiles:
   MoE kernel; this is the strict same-kernel numerical oracle.
 - `cache_mixed_prefill_stream`: topology-driven P1 next-layer staging with two
   layer-sized cache buffers.
+- `cache_mixed_prefill_oracle`: repeated-input prefill oracle. It loads an exact
+  route-transition JSONL, submits only the selected experts for the next layer,
+  applies a phase-specific bandwidth/window byte budget, and uses one large
+  O_DIRECT P2 request inside global QD=2 so one submission slot is always
+  available to P0 demand. The current measured-budget profile uses 50 ms,
+  2048 MiB/s and 80% utilization: 81.92 MiB, or at most 9 objects of
+  9,191,424 bytes per prefill layer.
+- `cache_mixed_decode_oracle`: repeated-input decode oracle. Its route key is
+  `(token_id, source layer, current expert set)`, so repeated expert sets in
+  different generated tokens cannot be merged into a statistical pseudo-oracle.
+  Prefill prediction is disabled; the cyclic final-layer to next-token first-layer
+  transition is included. The 12 ms / 2048 MiB/s / 80% decode budget admits at
+  most two 9,191,424-byte experts per transition.
 - `cache_mixed_predict_history`: model-generic history prediction plus P2 prefetch.
 - `cache_mixed_predict_mlp`: prompt-isolated safetensors MLP plus P2 prefetch.
 
 Cross-backend CPU vs CUDA comparisons are reported separately because floating
 point accumulation may differ. The strict Gate uses promote vs mapped so a failure
 isolates slot addressing/delivery rather than CPU/CUDA numerical variation.
+
+The oracle trace can be regenerated from a native full-prompt route/load trace:
+
+```bash
+python3 tools/export_native_moe_oracle_trace.py \
+  --input experiments/pdcat/runs/native-moe-oracle-source-8g-p128-v04-20260812-r01/native_moe_profile.jsonl \
+  --output experiments/pdcat/oracles/deepseek-v2-lite-q8_0-p128-hello.jsonl \
+  --prompt-tokens 128 --model-prefix runtime
+```
+
+This oracle is exact-only: an unseen transition returns no prediction and leaves
+the native P0 path unchanged. `PDCAT_IO_MAX_P2_QD` controls speculative I/O
+parallelism independently of global `PDCAT_IO_MAX_QD`; when global QD exceeds
+one, the scheduler clamps P2 QD to at most `global QD - 1`.
+
+The predictor budget is computed as
+`bandwidth_mib_s * window_us * utilization / 1e6`; the candidate count is then
+bounded by `budget_bytes / expert_slot_bytes`. Prefill and decode use independent
+`LLAMA_MOE_*_PREFETCH_WINDOW_US` values. Every prediction submission, including
+the resulting byte budget and candidate list, is written as a structured
+`predictor_submission` record in `moe_gate.jsonl`.
+The phase is carried on every C++/FFI/InterfaceIO prediction request, so a
+single process can use `PrefillStaging` for prefill and pollution-resistant
+`Speculative` residency for decode; `PDCAT_PHASE` is only a compatibility
+fallback for older callers.
+Router records also store `expert_token_counts`, aligned with the sorted expert
+IDs. This makes token-weighted candidate coverage measurable instead of assuming
+that load balancing makes all selected experts equally valuable.
+
+For decode, export every ordered route occurrence rather than collapsing by
+layer:
+
+```bash
+python3 tools/export_native_moe_oracle_trace.py \
+  --input <baseline-run>/moe_gate.jsonl \
+  --output <oracle.jsonl> --token-aware --model-prefix runtime
+```
+
+The exporter rejects missing token IDs, conflicting duplicate positions, layer
+wraps without a token increment, and multi-request input. The Rust exact
+predictor also rejects one token/layer/current-state key with two different
+targets. Runtime online observations carry the same token ID, so they cannot
+create an unlabelled fallback beside a strict trace.
+
+Estimate the candidate/read upper bound for any supported MoE route trace without
+running the model:
+
+```bash
+python3 tools/estimate_pdcat_prefill_budget.py \
+  --routes <baseline-run>/moe_gate.jsonl --prompt-tokens 128
+```
+
+The controlled matrix uses the measured compute windows 50 ms for 128-token
+prefill and 72 ms for 256-token prefill. At the same 2048 MiB/s, 80% budget,
+these cap each layer at 9 and 13 expert objects respectively.
+
+`run_pdcat_prefill_oracle_matrix.py` hard-gates each pair on exact prompt length,
+identical command/source/config/model/pack/runtime-library fingerprints, identical
+native router selections, and identical generated output. It hashes the actual
+executable and locally linked shared objects. A recovered NVMe timeout still
+marks the pair contaminated and stops all later containers, but the completed
+run is read-only validated and summarized first so diagnostic evidence is not
+lost.
 
 ## Expert sidecar pack
 
@@ -201,6 +277,26 @@ python3 tools/run_pdcat_matrix.py \
   --case demand-cap64-qd6 --case prefill-stream-cap128 \
   --case history-top2 --case mlp-top2
 ```
+
+Plan (or, only after explicit device-risk approval, run) strict prefill and
+decode oracle matrices:
+
+```bash
+python3 tools/run_pdcat_prefill_oracle_matrix.py \
+  --matrix-id prefill-publication --dry-run
+python3 tools/run_pdcat_decode_oracle_matrix.py \
+  --matrix-id decode-publication --decode-tokens 64 --dry-run
+```
+
+Both runners cover 4/8 GiB × 128/256 prompt tokens. A real run additionally
+requires `--acknowledge-nvme-risk`, compares dmesg before/after every container,
+stops on the first new nvme1 error, and never retries. Each cell is
+baseline → trace export → identical-input oracle. The decode pair requires exact
+token-indexed router equality, exact generated stdout, prompt count, `n_predict-1`
+decode eval count, source/runtime/config/model/pack identity, and executable plus
+local shared-library hashes. `summarize_pdcat_decode_oracle.py` reports TPOT,
+prompt-eval TTFT proxy, per-token P0 blocking, prediction precision/recall,
+ready/on-time hits, physical read amplification, and wrong-prefetch bytes.
 
 The matrix defines one warmup and three measured repetitions for normal cases;
 very slow native baselines explicitly override that count. It covers capacities

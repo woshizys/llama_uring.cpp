@@ -161,6 +161,61 @@
         "LLAMA_MOE_PREFILL_STREAMING": "1"
       }
     },
+    "cache_mixed_prefill_oracle": {
+      "description": "Mapped CUDA path with deterministic next-layer prefill oracle and one large O_DIRECT P2 request; global QD=2 reserves one slot for P0 without reducing measured aggregate NVMe bandwidth.",
+      "use_expert_pack": true,
+      "args": [
+        "--gpu-layers",
+        "all",
+        "--fit",
+        "off",
+        "--no-mmap",
+        "--direct-io",
+        "--expert-cache-capacity",
+        "64"
+      ],
+      "environment": {
+        "LLAMA_MOE_CUDA_DELIVERY": "mapped",
+        "LLAMA_MOE_PREDICTOR": "trace-oracle",
+        "LLAMA_MOE_PREFILL_PREDICTOR": "1",
+        "LLAMA_MOE_PREDICTOR_TOP_N": "64",
+        "LLAMA_MOE_PREFILL_PREFETCH_WINDOW_US": "50000",
+        "LLAMA_MOE_DECODE_PREFETCH_WINDOW_US": "12000",
+        "LLAMA_MOE_PREFETCH_BANDWIDTH_MIB_S": "2048",
+        "LLAMA_MOE_PREFETCH_BANDWIDTH_UTILIZATION_PCT": "80",
+        "PDCAT_IO_MAX_QD": "2",
+        "PDCAT_IO_MAX_P2_QD": "1",
+        "PDCAT_PREDICTOR_TOP_K": "64",
+        "PDCAT_PREDICTOR_TRACE": "${REPO_ROOT}/experiments/pdcat/oracles/deepseek-v2-lite-q8_0-p128-hello.jsonl"
+      }
+    },
+    "cache_mixed_decode_oracle": {
+      "description": "Mapped CUDA path with token-indexed strict decode oracle; prefill prediction remains disabled.",
+      "use_expert_pack": true,
+      "args": [
+        "--gpu-layers",
+        "all",
+        "--fit",
+        "off",
+        "--no-mmap",
+        "--direct-io",
+        "--expert-cache-capacity",
+        "64"
+      ],
+      "environment": {
+        "LLAMA_MOE_CUDA_DELIVERY": "mapped",
+        "LLAMA_MOE_PREDICTOR": "trace-oracle",
+        "LLAMA_MOE_PREFILL_PREDICTOR": "0",
+        "LLAMA_MOE_PREDICTOR_TOP_N": "64",
+        "LLAMA_MOE_DECODE_PREFETCH_WINDOW_US": "12000",
+        "LLAMA_MOE_PREFETCH_BANDWIDTH_MIB_S": "2048",
+        "LLAMA_MOE_PREFETCH_BANDWIDTH_UTILIZATION_PCT": "80",
+        "PDCAT_IO_MAX_QD": "2",
+        "PDCAT_IO_MAX_P2_QD": "1",
+        "PDCAT_PREDICTOR_TOP_K": "64",
+        "PDCAT_PREDICTOR_TRACE": "${REPO_ROOT}/experiments/pdcat/oracles/deepseek-v2-lite-q8_0-decode-placeholder.jsonl"
+      }
+    },
     "cache_mixed_predict_history": {
       "description": "Mapped CUDA path with always-on model-generic history prediction and P2 prefetch.",
       "use_expert_pack": true,

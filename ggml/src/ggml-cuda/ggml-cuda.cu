@@ -88,6 +88,14 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__gnu_linux__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 struct ggml_cuda_moe_stats {
@@ -125,6 +133,145 @@ static uint64_t ggml_cuda_moe_now_ns() {
     return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+#if defined(__gnu_linux__)
+struct ggml_cuda_native_moe_profile_sample {
+    const char * path = nullptr;
+    int64_t load_start_us = 0;
+    int64_t load_wall_us = 0;
+    int64_t compute_start_us = 0;
+    int64_t compute_wall_us = 0;
+    int64_t load_cpu_us = 0;
+    int64_t compute_cpu_us = 0;
+    int64_t load_major_faults = 0;
+    int64_t load_minor_faults = 0;
+    int64_t compute_major_faults = 0;
+    int64_t compute_minor_faults = 0;
+    uint64_t read_bytes_before = 0;
+    uint64_t load_read_bytes = 0;
+    uint64_t compute_read_bytes = 0;
+    uint64_t resident_pages_before = 0;
+    uint64_t nonresident_pages_before = 0;
+    uint64_t required_bytes = 0;
+    int active_experts = 0;
+    struct rusage usage_before_load = {};
+    struct rusage usage_after_load = {};
+};
+
+static std::atomic<uint64_t> ggml_cuda_native_moe_profile_sequence{0};
+
+static int64_t ggml_cuda_native_moe_profile_now_us() {
+    return (int64_t) (ggml_cuda_moe_now_ns() / 1000);
+}
+
+static int64_t ggml_cuda_native_moe_profile_rusage_us(const struct rusage & usage) {
+    return (int64_t) usage.ru_utime.tv_sec * 1000000 + usage.ru_utime.tv_usec
+         + (int64_t) usage.ru_stime.tv_sec * 1000000 + usage.ru_stime.tv_usec;
+}
+
+static uint64_t ggml_cuda_native_moe_profile_read_bytes() {
+    FILE * file = std::fopen("/proc/self/io", "r");
+    if (file == nullptr) {
+        return 0;
+    }
+
+    uint64_t result = 0;
+    char line[128];
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        if (std::sscanf(line, "read_bytes: %" SCNu64, &result) == 1) {
+            break;
+        }
+    }
+    std::fclose(file);
+    return result;
+}
+
+static void ggml_cuda_native_moe_profile_begin(
+        ggml_cuda_native_moe_profile_sample & sample,
+        const ggml_tensor * src0,
+        const ggml_tensor * ids,
+        const std::vector<char> & ids_host,
+        size_t expert_bytes,
+        int64_t expert_count) {
+    if (src0->data == nullptr || ids_host.empty()) {
+        return;
+    }
+
+    std::vector<bool> active((size_t) expert_count, false);
+    for (int64_t token = 0; token < ids->ne[1]; ++token) {
+        for (int64_t rank = 0; rank < ids->ne[0]; ++rank) {
+            const int32_t expert = *(const int32_t *) (
+                    ids_host.data() + token*ids->nb[1] + rank*ids->nb[0]);
+            GGML_ASSERT(expert >= 0 && expert < expert_count);
+            active[(size_t) expert] = true;
+        }
+    }
+
+    for (int64_t expert = 0; expert < expert_count; ++expert) {
+        if (!active[(size_t) expert]) {
+            continue;
+        }
+        sample.active_experts++;
+        sample.required_bytes += expert_bytes;
+    }
+
+    sample.read_bytes_before = ggml_cuda_native_moe_profile_read_bytes();
+    getrusage(RUSAGE_SELF, &sample.usage_before_load);
+    sample.usage_after_load = sample.usage_before_load;
+    sample.compute_start_us = ggml_cuda_native_moe_profile_now_us();
+}
+
+static void ggml_cuda_native_moe_profile_finish(
+        ggml_cuda_native_moe_profile_sample & sample,
+        const ggml_tensor * src0,
+        const ggml_tensor * ids,
+        size_t expert_bytes) {
+    struct rusage usage_after_compute = {};
+    getrusage(RUSAGE_SELF, &usage_after_compute);
+    const uint64_t read_bytes_after_compute = ggml_cuda_native_moe_profile_read_bytes();
+    sample.compute_wall_us = ggml_cuda_native_moe_profile_now_us() - sample.compute_start_us;
+    sample.compute_cpu_us = ggml_cuda_native_moe_profile_rusage_us(usage_after_compute)
+                          - ggml_cuda_native_moe_profile_rusage_us(sample.usage_after_load);
+    sample.compute_major_faults = usage_after_compute.ru_majflt - sample.usage_after_load.ru_majflt;
+    sample.compute_minor_faults = usage_after_compute.ru_minflt - sample.usage_after_load.ru_minflt;
+    const uint64_t read_bytes_after_load = sample.read_bytes_before + sample.load_read_bytes;
+    sample.compute_read_bytes = read_bytes_after_compute >= read_bytes_after_load
+        ? read_bytes_after_compute - read_bytes_after_load : 0;
+
+    const int fd = open(sample.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return;
+    }
+    const uint64_t sequence = ggml_cuda_native_moe_profile_sequence.fetch_add(
+            1, std::memory_order_relaxed);
+    char json[2048];
+    const int length = std::snprintf(json, sizeof(json),
+            "{\"event\":\"native_cuda_moe_profile\",\"version\":1,\"sequence\":%" PRIu64
+            ",\"pid\":%d,\"tensor\":\"%s\",\"tokens\":%" PRId64
+            ",\"active_experts\":%d,\"expert_bytes\":%zu,\"required_bytes\":%" PRIu64
+            ",\"page_size\":%ld,\"resident_pages_before\":%" PRIu64
+            ",\"nonresident_pages_before\":%" PRIu64
+            ",\"load_wall_us\":%" PRId64 ",\"load_cpu_us\":%" PRId64
+            ",\"load_major_faults\":%" PRId64 ",\"load_minor_faults\":%" PRId64
+            ",\"load_read_bytes\":%" PRIu64
+            ",\"compute_wall_us\":%" PRId64 ",\"compute_cpu_us\":%" PRId64
+            ",\"compute_major_faults\":%" PRId64 ",\"compute_minor_faults\":%" PRId64
+            ",\"compute_read_bytes\":%" PRIu64 "}\n",
+            sequence, (int) getpid(), ggml_get_name(src0), ids->ne[1],
+            sample.active_experts, expert_bytes, sample.required_bytes,
+            sysconf(_SC_PAGESIZE), sample.resident_pages_before, sample.nonresident_pages_before,
+            sample.load_wall_us, sample.load_cpu_us,
+            sample.load_major_faults, sample.load_minor_faults, sample.load_read_bytes,
+            sample.compute_wall_us, sample.compute_cpu_us,
+            sample.compute_major_faults, sample.compute_minor_faults, sample.compute_read_bytes);
+    if (length > 0) {
+        const size_t bytes = std::min((size_t) length, sizeof(json) - 1);
+        const ssize_t written = write(fd, json, bytes);
+        GGML_UNUSED(written);
+    }
+    close(fd);
+}
+#endif
 
 static bool ggml_cuda_moe_stats_enabled() {
     static const bool enabled = [] {
@@ -2815,6 +2962,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const bool use_external_moe = (src0->flags & GGML_TENSOR_FLAG_EXTERNAL) != 0;
     const bool trace_native_moe = !use_external_moe
         && getenv("LLAMA_MOE_GATE_TRACE_JSONL") != nullptr;
+#if defined(__gnu_linux__)
+    const char * native_profile_path = std::getenv("LLAMA_NATIVE_MOE_PROFILE_JSONL");
+    const bool profile_native_moe = !use_external_moe
+        && native_profile_path != nullptr && native_profile_path[0] != '\0'
+        && src0->data != nullptr;
+    ggml_cuda_native_moe_profile_sample native_profile;
+    native_profile.path = native_profile_path;
+#else
+    const bool profile_native_moe = false;
+#endif
     cudaStream_t stream = ctx.stream();
     auto & moe_stats = ggml_cuda_moe_stats_instance();
     moe_stats.mul_mat_id_ops.fetch_add(1, std::memory_order_relaxed);
@@ -2831,7 +2988,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<const void *> moe_expert_ptrs_dev(ctx.pool());
     const void * const * moe_expert_ptrs = nullptr;
 
-    if (use_external_moe || trace_native_moe) {
+    if (use_external_moe || trace_native_moe || profile_native_moe) {
         bool ids_cache_hit = false;
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_moe_ids_cache_mutex());
@@ -2983,6 +3140,22 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
     }
 
+#if defined(__gnu_linux__)
+    if (profile_native_moe) {
+        ggml_cuda_native_moe_profile_begin(
+                native_profile, src0, ids, ids_host, nb02, ne02);
+    }
+    auto finish_native_profile = [&]() {
+        if (!profile_native_moe) {
+            return;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        ggml_cuda_native_moe_profile_finish(native_profile, src0, ids, nb02);
+    };
+#else
+    auto finish_native_profile = [&]() {};
+#endif
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -2996,11 +3169,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                         moe_stats.path_mmvq.fetch_add(1, std::memory_order_relaxed);
                         ggml_cuda_moe_stats_maybe_print();
                     }
+                    finish_native_profile();
                     return;
                 }
             } else if (!use_external_moe) {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                    finish_native_profile();
                     return;
                 }
             }
@@ -3013,11 +3188,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 moe_stats.path_mmq.fetch_add(1, std::memory_order_relaxed);
                 ggml_cuda_moe_stats_maybe_print();
             }
+            finish_native_profile();
             return;
         }
 
         if (!use_external_moe && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+            finish_native_profile();
             return;
         }
     }
@@ -3147,6 +3324,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_cuda_moe_expert_release_after_stream(stream, moe_expert_handle);
         ggml_cuda_moe_stats_maybe_print();
     }
+    finish_native_profile();
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {

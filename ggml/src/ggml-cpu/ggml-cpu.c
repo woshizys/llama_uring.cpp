@@ -35,6 +35,11 @@
 #include <stdarg.h>
 #include <signal.h>
 #if defined(__gnu_linux__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <syscall.h>
 #endif
 
@@ -1441,6 +1446,203 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+#if defined(__gnu_linux__)
+struct ggml_native_moe_profile_sample {
+    int64_t load_start_us;
+    int64_t load_wall_us;
+    int64_t compute_start_us;
+    int64_t compute_wall_us;
+    int64_t load_cpu_us;
+    int64_t compute_cpu_us;
+    int64_t load_major_faults;
+    int64_t load_minor_faults;
+    int64_t compute_major_faults;
+    int64_t compute_minor_faults;
+    uint64_t read_bytes_before;
+    uint64_t load_read_bytes;
+    uint64_t compute_read_bytes;
+    uint64_t resident_pages_before;
+    uint64_t nonresident_pages_before;
+    uint64_t required_bytes;
+    int active_experts;
+    struct rusage usage_before_load;
+    struct rusage usage_after_load;
+};
+
+static atomic_uint_fast64_t ggml_native_moe_profile_sequence = 0;
+static atomic_uint_fast64_t ggml_native_moe_profile_checksum = 0;
+
+static int64_t ggml_native_moe_profile_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static int64_t ggml_native_moe_profile_rusage_us(const struct rusage * usage) {
+    return (int64_t) usage->ru_utime.tv_sec * 1000000 + usage->ru_utime.tv_usec +
+           (int64_t) usage->ru_stime.tv_sec * 1000000 + usage->ru_stime.tv_usec;
+}
+
+static uint64_t ggml_native_moe_profile_read_bytes(void) {
+    FILE * file = fopen("/proc/self/io", "r");
+    if (file == NULL) {
+        return 0;
+    }
+
+    uint64_t result = 0;
+    char line[128];
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (sscanf(line, "read_bytes: %" SCNu64, &result) == 1) {
+            break;
+        }
+    }
+    fclose(file);
+    return result;
+}
+
+static void ggml_native_moe_profile_count_residency(
+        const struct ggml_tensor * src0,
+        const int64_t * matrix_row_counts,
+        int n_as,
+        size_t expert_bytes,
+        struct ggml_native_moe_profile_sample * sample) {
+    const long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0 || src0->data == NULL) {
+        return;
+    }
+
+    const size_t page_size = (size_t) page_size_long;
+    const size_t max_pages = (expert_bytes + 2 * page_size - 1) / page_size;
+    unsigned char * residency = (unsigned char *) malloc(max_pages);
+    if (residency == NULL) {
+        return;
+    }
+
+    for (int expert = 0; expert < n_as; ++expert) {
+        if (matrix_row_counts[expert] == 0) {
+            continue;
+        }
+
+        sample->active_experts += 1;
+        sample->required_bytes += expert_bytes;
+
+        const uintptr_t start = (uintptr_t) src0->data + (size_t) expert * expert_bytes;
+        const uintptr_t page_start = start & ~((uintptr_t) page_size - 1);
+        const uintptr_t end = start + expert_bytes;
+        const size_t pages = (end - page_start + page_size - 1) / page_size;
+
+        if (pages > max_pages || mincore((void *) page_start, pages * page_size, residency) != 0) {
+            continue;
+        }
+
+        for (size_t page = 0; page < pages; ++page) {
+            if ((residency[page] & 1) != 0) {
+                sample->resident_pages_before += 1;
+            } else {
+                sample->nonresident_pages_before += 1;
+            }
+        }
+    }
+
+    free(residency);
+}
+
+static void ggml_native_moe_profile_touch(
+        const struct ggml_tensor * src0,
+        const int64_t * matrix_row_counts,
+        int n_as,
+        size_t expert_bytes,
+        int ith,
+        int nth) {
+    const long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0 || src0->data == NULL) {
+        return;
+    }
+
+    const size_t page_size = (size_t) page_size_long;
+    uint64_t checksum = 0;
+
+    for (int expert = 0; expert < n_as; ++expert) {
+        if (matrix_row_counts[expert] == 0) {
+            continue;
+        }
+
+        const uintptr_t start = (uintptr_t) src0->data + (size_t) expert * expert_bytes;
+        const uintptr_t page_start = start & ~((uintptr_t) page_size - 1);
+        const uintptr_t end = start + expert_bytes;
+        const size_t pages = (end - page_start + page_size - 1) / page_size;
+        const size_t first_page = pages * (size_t) ith / (size_t) nth;
+        const size_t last_page = pages * (size_t) (ith + 1) / (size_t) nth;
+
+        for (size_t page = first_page; page < last_page; ++page) {
+            uintptr_t address = page_start + page * page_size;
+            if (address < start) {
+                address = start;
+            }
+            checksum ^= *(const volatile unsigned char *) address;
+        }
+    }
+
+    atomic_fetch_xor_explicit(&ggml_native_moe_profile_checksum, checksum, memory_order_relaxed);
+}
+
+static void ggml_native_moe_profile_write(
+        const char * path,
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * ids,
+        size_t expert_bytes,
+        const struct ggml_native_moe_profile_sample * sample) {
+    const int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return;
+    }
+
+    const uint64_t sequence = atomic_fetch_add_explicit(
+            &ggml_native_moe_profile_sequence, 1, memory_order_relaxed);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    char json[2048];
+    const int length = snprintf(json, sizeof(json),
+            "{\"event\":\"native_moe_profile\",\"version\":1,\"sequence\":%" PRIu64
+            ",\"pid\":%d,\"tensor\":\"%s\",\"tokens\":%" PRId64
+            ",\"active_experts\":%d,\"expert_bytes\":%zu,\"required_bytes\":%" PRIu64
+            ",\"page_size\":%ld,\"resident_pages_before\":%" PRIu64
+            ",\"nonresident_pages_before\":%" PRIu64
+            ",\"load_wall_us\":%" PRId64 ",\"load_cpu_us\":%" PRId64
+            ",\"load_major_faults\":%" PRId64 ",\"load_minor_faults\":%" PRId64
+            ",\"load_read_bytes\":%" PRIu64
+            ",\"compute_wall_us\":%" PRId64 ",\"compute_cpu_us\":%" PRId64
+            ",\"compute_major_faults\":%" PRId64 ",\"compute_minor_faults\":%" PRId64
+            ",\"compute_read_bytes\":%" PRIu64 "}\n",
+            sequence,
+            (int) getpid(),
+            ggml_get_name(src0),
+            ids->ne[1],
+            sample->active_experts,
+            expert_bytes,
+            sample->required_bytes,
+            page_size,
+            sample->resident_pages_before,
+            sample->nonresident_pages_before,
+            sample->load_wall_us,
+            sample->load_cpu_us,
+            sample->load_major_faults,
+            sample->load_minor_faults,
+            sample->load_read_bytes,
+            sample->compute_wall_us,
+            sample->compute_cpu_us,
+            sample->compute_major_faults,
+            sample->compute_minor_faults,
+            sample->compute_read_bytes);
+
+    if (length > 0) {
+        const size_t bytes = MIN((size_t) length, sizeof(json) - 1);
+        ssize_t written = write(fd, json, bytes);
+        UNUSED(written);
+    }
+    close(fd);
+}
+#endif
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1524,6 +1726,12 @@ static void ggml_compute_forward_mul_mat_id(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+#if defined(__gnu_linux__)
+    const char * native_profile_path = getenv("LLAMA_NATIVE_CPU_MOE_PROFILE_JSONL");
+    const bool native_profile_enabled = native_profile_path != NULL && native_profile_path[0] != '\0' && src0->data != NULL;
+    struct ggml_native_moe_profile_sample native_profile = { 0 };
+#endif
 
     const enum ggml_type type = src0->type;
 
@@ -1633,6 +1841,39 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+#if defined(__gnu_linux__)
+    if (native_profile_enabled) {
+        const size_t expert_bytes = nb02;
+        if (ith == 0) {
+            ggml_native_moe_profile_count_residency(
+                    src0, matrix_row_counts, n_as, expert_bytes, &native_profile);
+            native_profile.read_bytes_before = ggml_native_moe_profile_read_bytes();
+            getrusage(RUSAGE_SELF, &native_profile.usage_before_load);
+            native_profile.load_start_us = ggml_native_moe_profile_now_us();
+        }
+
+        ggml_barrier(params->threadpool);
+        ggml_native_moe_profile_touch(src0, matrix_row_counts, n_as, expert_bytes, ith, nth);
+        ggml_barrier(params->threadpool);
+
+        if (ith == 0) {
+            struct rusage usage_after_load;
+            getrusage(RUSAGE_SELF, &usage_after_load);
+            const uint64_t read_bytes_after_load = ggml_native_moe_profile_read_bytes();
+            native_profile.load_wall_us = ggml_native_moe_profile_now_us() - native_profile.load_start_us;
+            native_profile.load_cpu_us = ggml_native_moe_profile_rusage_us(&usage_after_load) -
+                    ggml_native_moe_profile_rusage_us(&native_profile.usage_before_load);
+            native_profile.load_major_faults = usage_after_load.ru_majflt - native_profile.usage_before_load.ru_majflt;
+            native_profile.load_minor_faults = usage_after_load.ru_minflt - native_profile.usage_before_load.ru_minflt;
+            native_profile.load_read_bytes = read_bytes_after_load >= native_profile.read_bytes_before ?
+                    read_bytes_after_load - native_profile.read_bytes_before : 0;
+            native_profile.usage_after_load = usage_after_load;
+            native_profile.compute_start_us = ggml_native_moe_profile_now_us();
+        }
+        ggml_barrier(params->threadpool);
+    }
+#endif
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1700,6 +1941,22 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
     if (ith == 0) {
+#if defined(__gnu_linux__)
+        if (native_profile_enabled) {
+            struct rusage usage_after_compute;
+            getrusage(RUSAGE_SELF, &usage_after_compute);
+            const uint64_t read_bytes_after_compute = ggml_native_moe_profile_read_bytes();
+            native_profile.compute_wall_us = ggml_native_moe_profile_now_us() - native_profile.compute_start_us;
+            native_profile.compute_cpu_us = ggml_native_moe_profile_rusage_us(&usage_after_compute) -
+                    ggml_native_moe_profile_rusage_us(&native_profile.usage_after_load);
+            native_profile.compute_major_faults = usage_after_compute.ru_majflt - native_profile.usage_after_load.ru_majflt;
+            native_profile.compute_minor_faults = usage_after_compute.ru_minflt - native_profile.usage_after_load.ru_minflt;
+            const uint64_t read_bytes_after_load = native_profile.read_bytes_before + native_profile.load_read_bytes;
+            native_profile.compute_read_bytes = read_bytes_after_compute >= read_bytes_after_load ?
+                    read_bytes_after_compute - read_bytes_after_load : 0;
+            ggml_native_moe_profile_write(native_profile_path, src0, ids, nb02, &native_profile);
+        }
+#endif
         ggml_moe_expert_release(moe_expert_handle);
     }
 }

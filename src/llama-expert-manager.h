@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <stdexcept>
@@ -147,6 +148,7 @@ int32_t llama_expert_manager_predict_prefetch_next(
         size_t max_predictions,
         uint64_t current_token_id,
         uint64_t deadline_ns,
+        int32_t phase,
         llama_expert_prediction_ffi * predictions_out,
         size_t predictions_capacity);
 
@@ -155,7 +157,8 @@ llama_expert_ticket_ffi * llama_expert_manager_submit_batch_async(
         int32_t layer,
         const int32_t * experts,
         size_t count,
-        uint64_t token_id);
+        uint64_t token_id,
+        int32_t phase);
 
 llama_expert_handle_ffi * llama_expert_ticket_get_handle(
         const llama_expert_ticket_ffi * ticket,
@@ -473,6 +476,10 @@ public:
         return capacity_;
     }
 
+    size_t slot_size() const {
+        return layout_.slot_size;
+    }
+
     const TensorLayoutEntry * layout_entry(MoePart part) const {
         for (const TensorLayoutEntry & entry : layout_.entries) {
             if (entry.part == part) {
@@ -625,7 +632,8 @@ public:
             std::vector<float> router_scores,
             size_t max_predictions,
             uint64_t current_token_id,
-            uint64_t deadline_ns) {
+            uint64_t deadline_ns,
+            const char * phase) {
         if (!router_scores.empty() && router_scores.size() != experts.size()) {
             throw std::invalid_argument("router score count must match expert count");
         }
@@ -667,6 +675,7 @@ public:
                 max_predictions,
                 current_token_id,
                 deadline_ns,
+                std::strcmp(phase, "prefill") == 0 ? 1 : 0,
                 raw.data(),
                 raw.size());
         if (count < 0) {
@@ -692,7 +701,8 @@ public:
 
     ExpertTicket submit_batch_async(
             std::vector<ExpertKey> experts,
-            uint64_t token_id = UINT64_MAX) {
+            uint64_t token_id = UINT64_MAX,
+            const char * phase = "decode") {
         std::sort(experts.begin(), experts.end());
         experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
 
@@ -715,7 +725,8 @@ public:
                 layer,
                 expert_ids.data(),
                 expert_ids.size(),
-                token_id);
+                token_id,
+                std::strcmp(phase, "prefill") == 0 ? 1 : 0);
         if (ticket == nullptr) {
             const char * err = llama_expert_manager_last_error_message();
             if (err != nullptr && err[0] != '\0') {

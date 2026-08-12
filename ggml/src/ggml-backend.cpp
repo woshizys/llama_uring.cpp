@@ -20,11 +20,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
 #include <vector>
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#endif
+
+#if defined(__gnu_linux__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/types.h>
+#include <unistd.h>
 #endif
 
 
@@ -1538,6 +1549,190 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+#if defined(__gnu_linux__)
+struct ggml_native_moe_load_profile_sample {
+    int64_t start_us = 0;
+    uint64_t read_bytes_before = 0;
+    uint64_t resident_pages_before = 0;
+    uint64_t nonresident_pages_before = 0;
+    uint64_t required_bytes = 0;
+    int active_experts = 0;
+    struct rusage usage_before = {};
+};
+
+static std::atomic<uint64_t> ggml_native_moe_load_profile_sequence{0};
+
+static int64_t ggml_native_moe_load_profile_now_us() {
+    return (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static int64_t ggml_native_moe_load_profile_rusage_us(const struct rusage & usage) {
+    return (int64_t) usage.ru_utime.tv_sec*1000000 + usage.ru_utime.tv_usec
+         + (int64_t) usage.ru_stime.tv_sec*1000000 + usage.ru_stime.tv_usec;
+}
+
+static uint64_t ggml_native_moe_load_profile_read_bytes() {
+    FILE * file = fopen("/proc/self/io", "r");
+    if (file == nullptr) {
+        return 0;
+    }
+    uint64_t result = 0;
+    char line[128];
+    while (fgets(line, sizeof(line), file) != nullptr) {
+        if (sscanf(line, "read_bytes: %" SCNu64, &result) == 1) {
+            break;
+        }
+    }
+    fclose(file);
+    return result;
+}
+
+static bool ggml_native_moe_load_profile_file_offset(
+        const void * address,
+        uint64_t & file_offset) {
+    FILE * maps = fopen("/proc/self/maps", "r");
+    if (maps == nullptr) {
+        return false;
+    }
+    bool found = false;
+    char line[8192];
+    while (fgets(line, sizeof(line), maps) != nullptr) {
+        unsigned long start = 0;
+        unsigned long end = 0;
+        unsigned long long mapping_offset = 0;
+        char permissions[5] = {};
+        char path[4096] = {};
+        const int fields = sscanf(
+                line,
+                "%lx-%lx %4s %llx %*s %*s %4095[^\n]",
+                &start, &end, permissions, &mapping_offset, path);
+        const uintptr_t pointer = (uintptr_t) address;
+        if (fields != 5 || pointer < start || pointer >= end || permissions[0] != 'r') {
+            continue;
+        }
+        file_offset = (uint64_t) mapping_offset + (uint64_t) (pointer - start);
+        found = true;
+        break;
+    }
+    fclose(maps);
+    return found;
+}
+
+static void ggml_native_moe_load_profile_begin(
+        ggml_native_moe_load_profile_sample & sample,
+        const ggml_tensor * input,
+        const std::vector<ggml_bitset_t> & used_ids,
+        int64_t n_expert,
+        size_t expert_size) {
+    const long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long > 0 && input->data != nullptr) {
+        const size_t page_size = (size_t) page_size_long;
+        const size_t max_pages = (expert_size + 2*page_size - 1)/page_size;
+        std::vector<unsigned char> residency(max_pages);
+        for (int64_t expert = 0; expert < n_expert; ++expert) {
+            if (!ggml_bitset_get(used_ids.data(), expert)) {
+                continue;
+            }
+            sample.active_experts++;
+            sample.required_bytes += expert_size;
+            const uintptr_t start = (uintptr_t) input->data + (size_t) expert*expert_size;
+            const uintptr_t page_start = start & ~((uintptr_t) page_size - 1);
+            const uintptr_t end = start + expert_size;
+            const size_t pages = (end - page_start + page_size - 1)/page_size;
+            if (pages > residency.size()
+                    || mincore((void *) page_start, pages*page_size, residency.data()) != 0) {
+                continue;
+            }
+            for (size_t page = 0; page < pages; ++page) {
+                if ((residency[page] & 1) != 0) {
+                    sample.resident_pages_before++;
+                } else {
+                    sample.nonresident_pages_before++;
+                }
+            }
+        }
+    }
+    sample.read_bytes_before = ggml_native_moe_load_profile_read_bytes();
+    getrusage(RUSAGE_SELF, &sample.usage_before);
+    sample.start_us = ggml_native_moe_load_profile_now_us();
+}
+
+static void ggml_native_moe_load_profile_finish(
+        const char * path,
+        const ggml_native_moe_load_profile_sample & sample,
+        const ggml_tensor * input,
+        const ggml_tensor * ids_tensor,
+        const std::vector<ggml_bitset_t> & used_ids,
+        int64_t n_expert,
+        size_t expert_size) {
+    struct rusage usage_after = {};
+    getrusage(RUSAGE_SELF, &usage_after);
+    const int64_t wall_us = ggml_native_moe_load_profile_now_us() - sample.start_us;
+    const int64_t cpu_us = ggml_native_moe_load_profile_rusage_us(usage_after)
+                         - ggml_native_moe_load_profile_rusage_us(sample.usage_before);
+    const uint64_t read_bytes_after = ggml_native_moe_load_profile_read_bytes();
+    const uint64_t read_bytes = read_bytes_after >= sample.read_bytes_before
+        ? read_bytes_after - sample.read_bytes_before : 0;
+    const int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return;
+    }
+    const uint64_t sequence = ggml_native_moe_load_profile_sequence.fetch_add(
+            1, std::memory_order_relaxed);
+    uint64_t tensor_file_offset = UINT64_MAX;
+    ggml_native_moe_load_profile_file_offset(input->data, tensor_file_offset);
+    char expert_ids_json[512];
+    size_t expert_ids_length = 0;
+    expert_ids_json[expert_ids_length++] = '[';
+    bool first_expert = true;
+    for (int64_t expert = 0; expert < n_expert; ++expert) {
+        if (!ggml_bitset_get(used_ids.data(), expert)) {
+            continue;
+        }
+        const int written = snprintf(
+                expert_ids_json + expert_ids_length,
+                sizeof(expert_ids_json) - expert_ids_length,
+                "%s%" PRId64,
+                first_expert ? "" : ",",
+                expert);
+        if (written <= 0 || (size_t) written >= sizeof(expert_ids_json) - expert_ids_length) {
+            break;
+        }
+        expert_ids_length += (size_t) written;
+        first_expert = false;
+    }
+    expert_ids_json[std::min(expert_ids_length, sizeof(expert_ids_json) - 2)] = ']';
+    expert_ids_json[std::min(expert_ids_length + 1, sizeof(expert_ids_json) - 1)] = '\0';
+    char json[2048];
+    const int length = snprintf(json, sizeof(json),
+            "{\"event\":\"native_moe_load_profile\",\"version\":1,\"sequence\":%" PRIu64
+            ",\"pid\":%d,\"tensor\":\"%s\",\"tokens\":%" PRId64
+            ",\"active_experts\":%d,\"expert_count\":%" PRId64
+            ",\"expert_ids\":%s,\"expert_bytes\":%zu"
+            ",\"tensor_file_offset\":%" PRIu64 ",\"required_bytes\":%" PRIu64
+            ",\"page_size\":%ld,\"resident_pages_before\":%" PRIu64
+            ",\"nonresident_pages_before\":%" PRIu64
+            ",\"load_wall_us\":%" PRId64 ",\"load_cpu_us\":%" PRId64
+            ",\"load_major_faults\":%ld,\"load_minor_faults\":%ld"
+            ",\"load_read_bytes\":%" PRIu64 "}\n",
+            sequence, (int) getpid(), ggml_get_name(input), ids_tensor->ne[1],
+            sample.active_experts, n_expert, expert_ids_json, expert_size,
+            tensor_file_offset, sample.required_bytes,
+            sysconf(_SC_PAGESIZE), sample.resident_pages_before, sample.nonresident_pages_before,
+            wall_us, cpu_us,
+            usage_after.ru_majflt - sample.usage_before.ru_majflt,
+            usage_after.ru_minflt - sample.usage_before.ru_minflt,
+            read_bytes);
+    if (length > 0) {
+        const size_t bytes = std::min((size_t) length, sizeof(json) - 1);
+        const ssize_t written = write(fd, json, bytes);
+        GGML_UNUSED(written);
+    }
+    close(fd);
+}
+#endif
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1620,6 +1815,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
+#if defined(__gnu_linux__)
+                    const char * native_profile_path = getenv("LLAMA_NATIVE_MOE_PROFILE_JSONL");
+                    const bool profile_native_moe = native_profile_path != nullptr
+                        && native_profile_path[0] != '\0';
+                    ggml_native_moe_load_profile_sample native_load_profile;
+                    if (profile_native_moe) {
+                        ggml_backend_synchronize(split_backend);
+                        ggml_native_moe_load_profile_begin(
+                                native_load_profile, input, used_ids, n_expert, expert_size);
+                    }
+#endif
+
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
@@ -1658,6 +1865,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+#if defined(__gnu_linux__)
+                    if (profile_native_moe) {
+                        ggml_backend_synchronize(split_backend);
+                        ggml_native_moe_load_profile_finish(
+                                native_profile_path,
+                                native_load_profile,
+                                input,
+                                ids_tensor,
+                                used_ids,
+                                n_expert,
+                                expert_size);
+                    }
+#endif
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface

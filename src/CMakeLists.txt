@@ -59,10 +59,16 @@ if (LLAMA_EXPERT_CACHE)
     find_program(CARGO_EXECUTABLE cargo REQUIRED)
     find_library(LLAMA_EXPERT_CACHE_URING_LIBRARY uring REQUIRED)
     set(LLAMA_EXPERT_CACHE_FFI_MANIFEST ${CMAKE_SOURCE_DIR}/rust/expert-cache-ffi/Cargo.toml)
-    set(LLAMA_EXPERT_CACHE_FFI_LIB ${CMAKE_SOURCE_DIR}/rust/expert-cache-ffi/target/release/libllama_expert_cache_ffi.a)
+    set(LLAMA_EXPERT_CACHE_CARGO_TARGET_DIR
+        ${CMAKE_SOURCE_DIR}/rust/expert-cache-ffi/target
+        CACHE PATH "Cargo target directory for the Rust expert-cache FFI")
+    set(LLAMA_EXPERT_CACHE_FFI_LIB
+        ${LLAMA_EXPERT_CACHE_CARGO_TARGET_DIR}/release/libllama_expert_cache_ffi.a)
 
     add_custom_target(llama-expert-cache-ffi-build
-        COMMAND ${CARGO_EXECUTABLE} build --release --manifest-path ${LLAMA_EXPERT_CACHE_FFI_MANIFEST}
+        COMMAND ${CMAKE_COMMAND} -E env
+                CARGO_TARGET_DIR=${LLAMA_EXPERT_CACHE_CARGO_TARGET_DIR}
+                ${CARGO_EXECUTABLE} build --release --manifest-path ${LLAMA_EXPERT_CACHE_FFI_MANIFEST}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/rust/expert-cache-ffi
         COMMENT "Building Rust io-scheduler expert cache FFI"
         VERBATIM)

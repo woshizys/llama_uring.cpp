@@ -94,7 +94,8 @@ __attribute__((weak)) llama_expert_ticket_ffi * llama_expert_manager_submit_batc
         int32_t,
         const int32_t *,
         size_t,
-        uint64_t) {
+        uint64_t,
+        int32_t) {
     return nullptr;
 }
 
@@ -122,6 +123,7 @@ __attribute__((weak)) int32_t llama_expert_manager_predict_prefetch_next(
         size_t,
         uint64_t,
         uint64_t,
+        int32_t,
         llama_expert_prediction_ffi *,
         size_t) {
     return -1;
@@ -249,15 +251,24 @@ struct llama_moe_gate_trace_event {
     int64_t token_id = -1;
     int64_t token_count = 0;
     int32_t layer = -1;
+    int32_t target_layer = -1;
     int32_t expert = -1;
     int32_t part = -1;
     int32_t slot = -1;
     uint64_t generation = 0;
+    uint64_t deadline_ns = 0;
+    uint64_t budget_bytes = 0;
+    uint64_t expert_bytes = 0;
+    uint64_t window_us = 0;
+    uint64_t bandwidth_mib_s = 0;
+    uint64_t utilization_pct = 0;
+    uint64_t requested_predictions = 0;
     std::string kind;
     std::string run_id;
     std::string request_id;
     std::string phase;
     std::vector<int32_t> experts;
+    std::vector<int64_t> expert_token_counts;
     std::vector<float> router_scores;
 };
 
@@ -317,6 +328,16 @@ public:
                 }
                 output << ']';
             }
+            if (!event.expert_token_counts.empty()) {
+                output << ",\"expert_token_counts\":[";
+                for (size_t i = 0; i < event.expert_token_counts.size(); ++i) {
+                    if (i > 0) {
+                        output << ',';
+                    }
+                    output << event.expert_token_counts[i];
+                }
+                output << ']';
+            }
             if (!event.router_scores.empty()) {
                 output << ",\"router_scores\":[";
                 for (size_t i = 0; i < event.router_scores.size(); ++i) {
@@ -327,6 +348,16 @@ public:
                 }
                 output << ']';
             }
+            if (event.target_layer >= 0) {
+                output << ",\"target_layer_id\":" << event.target_layer
+                       << ",\"requested_predictions\":" << event.requested_predictions
+                       << ",\"budget_bytes\":" << event.budget_bytes
+                       << ",\"expert_bytes\":" << event.expert_bytes
+                       << ",\"window_us\":" << event.window_us
+                       << ",\"bandwidth_mib_s\":" << event.bandwidth_mib_s
+                       << ",\"utilization_pct\":" << event.utilization_pct
+                       << ",\"predicted_deadline_ns\":" << event.deadline_ns;
+            }
             output << "}\n";
         }
     }
@@ -335,17 +366,24 @@ public:
             int32_t layer,
             int64_t token_count,
             const std::vector<int32_t> & experts,
-            const std::vector<float> & router_scores) {
+            const std::vector<int64_t> & expert_token_counts,
+            const std::vector<float> & router_scores,
+            int64_t token_id = -1) {
         if (path_.empty()) {
             return;
         }
         llama_moe_gate_trace_event event;
         capture_context(event, token_count);
+        if (token_id >= 0) {
+            event.token_id = token_id;
+        }
+        event.phase = token_count > 1 ? "prefill" : "decode";
         event.timestamp_ns = now_ns();
         event.layer = layer;
         event.kind = "router_selection";
         event.router_scores = router_scores;
         event.experts = experts;
+        event.expert_token_counts = expert_token_counts;
 
         const std::string route_key =
                 event.request_id + "|" + event.phase + "|" +
@@ -360,7 +398,12 @@ public:
         events_.push_back(std::move(event));
     }
 
-    void record_slot(int32_t layer, int32_t expert, MoePart part, const ExpertHandle & handle) {
+    void record_slot(
+            int32_t layer,
+            int32_t expert,
+            MoePart part,
+            const ExpertHandle & handle,
+            const char * phase) {
         if (path_.empty()) {
             return;
         }
@@ -374,6 +417,50 @@ public:
         event.slot = handle.slot_id();
         event.generation = handle.generation();
         event.kind = "expert_slot_ready";
+        event.phase = phase;
+        std::lock_guard<std::mutex> lock(mutex_);
+        events_.push_back(std::move(event));
+    }
+
+    void record_prediction(
+            int32_t source_layer,
+            int32_t target_layer,
+            int64_t token_count,
+            uint64_t token_id,
+            const char * phase,
+            const std::vector<ExpertPrediction> & predictions,
+            size_t requested_predictions,
+            size_t budget_bytes,
+            size_t expert_bytes,
+            size_t window_us,
+            size_t bandwidth_mib_s,
+            size_t utilization_pct,
+            uint64_t deadline_ns) {
+        if (path_.empty()) {
+            return;
+        }
+        llama_moe_gate_trace_event event;
+        capture_context(event, token_count);
+        event.sequence = sequence_.fetch_add(1, std::memory_order_relaxed);
+        event.timestamp_ns = now_ns();
+        event.token_id = static_cast<int64_t>(token_id);
+        event.layer = source_layer;
+        event.target_layer = target_layer;
+        event.kind = "predictor_submission";
+        event.phase = phase;
+        event.requested_predictions = requested_predictions;
+        event.budget_bytes = budget_bytes;
+        event.expert_bytes = expert_bytes;
+        event.window_us = window_us;
+        event.bandwidth_mib_s = bandwidth_mib_s;
+        event.utilization_pct = utilization_pct;
+        event.deadline_ns = deadline_ns;
+        event.experts.reserve(predictions.size());
+        event.router_scores.reserve(predictions.size());
+        for (const auto & prediction : predictions) {
+            event.experts.push_back(prediction.expert);
+            event.router_scores.push_back(prediction.probability);
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         events_.push_back(std::move(event));
     }
@@ -446,12 +533,13 @@ struct llama_moe_expert_shared_key_hash {
 
 struct llama_moe_expert_shared_state {
     int32_t layer = -1;
+    std::string phase;
     ExpertTicket ticket;
     std::unordered_map<int32_t, ExpertHandle> handles;
     std::mutex mutex;
 
-    llama_moe_expert_shared_state(int32_t layer, ExpertTicket ticket)
-        : layer(layer), ticket(std::move(ticket)) {}
+    llama_moe_expert_shared_state(int32_t layer, const char * phase, ExpertTicket ticket)
+        : layer(layer), phase(phase), ticket(std::move(ticket)) {}
 
     const void * get_host(MoePart part, int32_t expert, const void * fallback) {
         {
@@ -478,7 +566,7 @@ struct llama_moe_expert_shared_state {
             }
 
             ExpertHandle handle = ticket.get_handle(layer, expert);
-            llama_moe_gate_trace_instance().record_slot(layer, expert, part, handle);
+            llama_moe_gate_trace_instance().record_slot(layer, expert, part, handle, phase.c_str());
             auto [it, inserted] = handles.emplace(expert, std::move(handle));
             (void) inserted;
 
@@ -521,7 +609,7 @@ struct llama_moe_expert_shared_state {
             }
 
             ExpertHandle handle = ticket.get_handle(layer, expert);
-            llama_moe_gate_trace_instance().record_slot(layer, expert, part, handle);
+            llama_moe_gate_trace_instance().record_slot(layer, expert, part, handle, phase.c_str());
             auto [it, inserted] = handles.emplace(expert, std::move(handle));
             (void) inserted;
 
@@ -558,7 +646,8 @@ struct llama_moe_expert_shared_state {
 
             auto ready = ticket.wait_any_ready(layer, experts, static_cast<size_t>(count));
             const int32_t expert = ready.first;
-            llama_moe_gate_trace_instance().record_slot(layer, expert, part, ready.second);
+            llama_moe_gate_trace_instance().record_slot(
+                    layer, expert, part, ready.second, phase.c_str());
             auto [it, inserted] = handles.emplace(expert, std::move(ready.second));
             (void) inserted;
 
@@ -665,6 +754,17 @@ bool llama_moe_prefill_streaming_enabled() {
     return enabled;
 }
 
+bool llama_moe_prefill_predictor_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("LLAMA_MOE_PREFILL_PREDICTOR");
+        return value != nullptr
+            && value[0] != '\0'
+            && std::strcmp(value, "0") != 0
+            && std::strcmp(value, "off") != 0;
+    }();
+    return enabled;
+}
+
 void llama_moe_prefill_stream_next(ExpertManager * manager, int32_t current_layer) {
     if (!llama_moe_prefill_streaming_enabled() || manager == nullptr) {
         return;
@@ -698,7 +798,7 @@ uint64_t llama_moe_now_ns() {
 
 class llama_moe_online_predictor {
 public:
-    uint64_t begin_decode_layer(
+    uint64_t begin_layer(
             ExpertManager * manager,
             int32_t layer,
             const std::vector<int32_t> & actual_experts) {
@@ -751,18 +851,60 @@ public:
             int32_t layer,
             const std::vector<int32_t> & actual_experts,
             const std::vector<float> & router_scores,
-            uint64_t generation) {
+            uint64_t generation,
+            const char * phase,
+            int64_t token_count) {
         if (!llama_moe_predictor_enabled() || manager == nullptr || actual_experts.empty()) {
             return;
         }
 
-        const size_t top_n = std::max<size_t>(
+        const size_t requested_top_n = std::max<size_t>(
                 1,
                 std::min<size_t>(
                         256,
                         llama_expert_cache_env_mib("LLAMA_MOE_PREDICTOR_TOP_N", 2)));
-        const size_t deadline_us =
-                llama_expert_cache_env_mib("LLAMA_MOE_PREDICTOR_DEADLINE_US", 2000);
+        const bool is_prefill = std::strcmp(phase, "prefill") == 0;
+        const char * window_name = is_prefill
+                ? "LLAMA_MOE_PREFILL_PREFETCH_WINDOW_US"
+                : "LLAMA_MOE_DECODE_PREFETCH_WINDOW_US";
+        const size_t window_us = llama_expert_cache_env_mib(window_name, 0);
+        const size_t bandwidth_mib_s =
+                llama_expert_cache_env_mib("LLAMA_MOE_PREFETCH_BANDWIDTH_MIB_S", 0);
+        const size_t utilization_pct = std::min<size_t>(
+                100,
+                llama_expert_cache_env_mib(
+                        "LLAMA_MOE_PREFETCH_BANDWIDTH_UTILIZATION_PCT", 80));
+        const size_t expert_bytes = manager->slot_size();
+        size_t top_n = requested_top_n;
+        size_t budget_bytes = 0;
+        if (window_us > 0 && bandwidth_mib_s > 0 && expert_bytes > 0) {
+            const long double available_bytes =
+                    static_cast<long double>(bandwidth_mib_s) * 1048576.0L
+                    * static_cast<long double>(window_us) / 1000000.0L
+                    * static_cast<long double>(utilization_pct) / 100.0L;
+            budget_bytes = available_bytes >= static_cast<long double>(SIZE_MAX)
+                    ? SIZE_MAX
+                    : static_cast<size_t>(available_bytes);
+            top_n = std::min(top_n, budget_bytes / expert_bytes);
+        }
+        if (top_n == 0) {
+            std::fprintf(stderr,
+                    "[PDCAT][predictor-budget-skip] source_layer=%d phase=%s"
+                    " requested=%zu window_us=%zu bandwidth_mib_s=%zu"
+                    " utilization_pct=%zu budget_bytes=%zu expert_bytes=%zu\n",
+                    layer,
+                    phase,
+                    requested_top_n,
+                    window_us,
+                    bandwidth_mib_s,
+                    utilization_pct,
+                    budget_bytes,
+                    expert_bytes);
+            return;
+        }
+        const size_t deadline_us = window_us > 0
+                ? window_us
+                : llama_expert_cache_env_mib("LLAMA_MOE_PREDICTOR_DEADLINE_US", 2000);
         const uint64_t deadline_ns =
                 llama_moe_now_ns() + static_cast<uint64_t>(deadline_us) * 1000;
 
@@ -774,7 +916,8 @@ public:
                             router_scores,
                             top_n,
                             generation,
-                            deadline_ns);
+                            deadline_ns,
+                            phase);
             if (predictions.empty()) {
                 return;
             }
@@ -792,6 +935,21 @@ public:
                 states_[manager].pending[target_layer] = predictions;
             }
 
+            llama_moe_gate_trace_instance().record_prediction(
+                    layer,
+                    target_layer,
+                    token_count,
+                    generation,
+                    phase,
+                    predictions,
+                    requested_top_n,
+                    budget_bytes,
+                    expert_bytes,
+                    window_us,
+                    bandwidth_mib_s,
+                    utilization_pct,
+                    deadline_ns);
+
             std::ostringstream ids;
             for (size_t i = 0; i < predictions.size(); ++i) {
                 if (i > 0) {
@@ -802,12 +960,23 @@ public:
             std::fprintf(stderr,
                     "[PDCAT][predictor-submit] generation=%" PRIu64
                     " source_layer=%d target_layer=%d candidates=%zu"
-                    " deadline_ns=%" PRIu64 " experts=%s\n",
+                    " requested=%zu budget_bytes=%zu expert_bytes=%zu"
+                    " window_us=%zu bandwidth_mib_s=%zu utilization_pct=%zu"
+                    " deadline_ns=%" PRIu64 " phase=%s tokens=%" PRId64
+                    " experts=%s\n",
                     generation,
                     layer,
                     target_layer,
                     predictions.size(),
+                    requested_top_n,
+                    budget_bytes,
+                    expert_bytes,
+                    window_us,
+                    bandwidth_mib_s,
+                    utilization_pct,
                     deadline_ns,
+                    phase,
+                    token_count,
                     ids.str().c_str());
         } catch (const std::exception & error) {
             LLAMA_LOG_WARN(
@@ -909,17 +1078,24 @@ void * llama_moe_expert_ensure_callback(
 
     std::vector<int32_t> active_experts;
     active_experts.reserve(static_cast<size_t>(ids->ne[0] * ids->ne[1]));
+    std::unordered_map<int32_t, int64_t> expert_token_counts_by_id;
 
     for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
         for (int64_t id = 0; id < ids->ne[0]; ++id) {
             const int32_t expert =
                 *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
             active_experts.push_back(expert);
+            ++expert_token_counts_by_id[expert];
         }
     }
 
     std::sort(active_experts.begin(), active_experts.end());
     active_experts.erase(std::unique(active_experts.begin(), active_experts.end()), active_experts.end());
+    std::vector<int64_t> expert_token_counts;
+    expert_token_counts.reserve(active_experts.size());
+    for (const int32_t expert : active_experts) {
+        expert_token_counts.push_back(expert_token_counts_by_id[expert]);
+    }
     const std::vector<float> router_scores =
             llama_moe_selected_router_scores(ids, router_scores_tensor, active_experts);
 
@@ -935,7 +1111,8 @@ void * llama_moe_expert_ensure_callback(
                         "%s: cannot derive native MoE layer from tensor %s\n",
                         __func__, src0->name);
             } else {
-                trace.record_route(layer, ids->ne[1], active_experts, router_scores);
+                trace.record_route(
+                        layer, ids->ne[1], active_experts, expert_token_counts, router_scores);
             }
         }
         return nullptr;
@@ -968,8 +1145,6 @@ void * llama_moe_expert_ensure_callback(
         }
     }
 
-    llama_moe_gate_trace_instance().record_route(
-            meta.layer, ids->ne[1], active_experts, router_scores);
     std::vector<ExpertKey> experts;
     experts.reserve(active_experts.size());
     for (const int32_t expert : active_experts) {
@@ -977,25 +1152,46 @@ void * llama_moe_expert_ensure_callback(
     }
 
     try {
-        const uint64_t generation = ids->ne[1] == 1
-                ? llama_moe_online_predictor_instance().begin_decode_layer(
+        const bool is_prefill = ids->ne[1] > 1;
+        const bool prefill_predictor = is_prefill
+                && llama_moe_prefill_predictor_enabled();
+        const bool invoke_predictor = !is_prefill || prefill_predictor;
+        const char * phase = is_prefill ? "prefill" : "decode";
+        const uint64_t generation = invoke_predictor
+                ? llama_moe_online_predictor_instance().begin_layer(
                         meta.manager, meta.layer, active_experts)
                 : UINT64_MAX;
+        llama_moe_gate_trace_instance().record_route(
+                meta.layer,
+                ids->ne[1],
+                active_experts,
+                expert_token_counts,
+                router_scores,
+                is_prefill ? 0 : static_cast<int64_t>(generation));
         auto state = std::make_shared<llama_moe_expert_shared_state>(
                 meta.layer,
-                meta.manager->submit_batch_async(std::move(experts), generation));
+                phase,
+                meta.manager->submit_batch_async(std::move(experts), generation, phase));
 
         // P0 demand is submitted first. During multi-token prefill, P1 may then
         // stage the complete next registered MoE layer without model hard-codes.
-        if (ids->ne[1] > 1) {
+        if (ids->ne[1] > 1 && !prefill_predictor) {
             llama_moe_prefill_stream_next(meta.manager, meta.layer);
         }
 
-        // Decode prediction is always invoked when enabled; confidence only
-        // changes the candidate list, never the native router selection.
-        if (ids->ne[1] == 1) {
+        // Prediction only moves bytes earlier and never changes the native
+        // router selection. Prefill prediction is opt-in so existing decode
+        // profiles retain their behavior and cannot accidentally combine with
+        // full-next-layer P1 staging.
+        if (invoke_predictor) {
             llama_moe_online_predictor_instance().observe_and_prefetch(
-                    meta.manager, meta.layer, active_experts, router_scores, generation);
+                    meta.manager,
+                    meta.layer,
+                    active_experts,
+                    router_scores,
+                    generation,
+                    phase,
+                    ids->ne[1]);
         }
 
         {

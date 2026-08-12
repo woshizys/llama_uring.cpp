@@ -18,9 +18,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pdcat_model import ModelInspectionError, inspect_from_run_config, sha256_file
-from summarize_pdcat_io import TraceError, summarize_jsonl
-from monitor_pdcat_process import summarize_jsonl as summarize_resource_jsonl
+try:
+    from .monitor_pdcat_process import summarize_jsonl as summarize_resource_jsonl
+    from .pdcat_model import ModelInspectionError, inspect_from_run_config, sha256_file
+    from .summarize_pdcat_io import TraceError, summarize_jsonl
+except ImportError:
+    from monitor_pdcat_process import summarize_jsonl as summarize_resource_jsonl
+    from pdcat_model import ModelInspectionError, inspect_from_run_config, sha256_file
+    from summarize_pdcat_io import TraceError, summarize_jsonl
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -309,6 +314,44 @@ def git_snapshot(repo: Path) -> dict[str, Any]:
         "dirty": bool(status.stdout.strip()) if status.returncode == 0 else None,
         "working_tree": status.stdout.splitlines() if status.returncode == 0 else [],
     }
+
+
+def runtime_artifact_snapshot(binary: Path) -> list[dict[str, Any]]:
+    """Hash the executable and locally built shared objects selected by ldd."""
+    resolved_binary = binary.resolve()
+    local_directory = resolved_binary.parent
+    paths = {resolved_binary}
+    linked = subprocess.run(
+        ["ldd", str(resolved_binary)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if linked.returncode == 0:
+        for line in linked.stdout.splitlines():
+            candidate: str | None = None
+            if "=>" in line:
+                target = line.split("=>", 1)[1].strip().split(maxsplit=1)
+                if target and target[0].startswith("/"):
+                    candidate = target[0]
+            else:
+                target = line.strip().split(maxsplit=1)
+                if target and target[0].startswith("/"):
+                    candidate = target[0]
+            if candidate is None:
+                continue
+            dependency = Path(candidate).resolve()
+            if dependency.parent == local_directory and dependency.is_file():
+                paths.add(dependency)
+
+    return [
+        {
+            "path": str(path),
+            "size_bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in sorted(paths, key=str)
+    ]
 
 
 def compact_inspection(inspection: dict[str, Any]) -> dict[str, Any]:
@@ -607,6 +650,7 @@ def main() -> int:
             "kernel": platform.release(),
         },
         "repositories": [git_snapshot(repo) for repo in DEFAULT_REPOSITORIES],
+        "runtime_artifacts": runtime_artifact_snapshot(binary),
         "model": compact_inspection(inspection),
         "model_sha256_expected": expected_hash,
         "model_sha256_verified": actual_hash is not None,
