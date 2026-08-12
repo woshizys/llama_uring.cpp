@@ -1,0 +1,243 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pdcat.local/schema/expert-pack-manifest-v1.json",
+  "title": "PDCat Expert Pack Manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "format",
+    "alignment",
+    "model",
+    "tensor_adapter",
+    "topology",
+    "pack",
+    "object_count",
+    "objects",
+    "verification"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "format": {
+      "const": "pdcat-expert-pack"
+    },
+    "created_at_utc": {
+      "type": "string"
+    },
+    "alignment": {
+      "type": "integer",
+      "minimum": 4096
+    },
+    "model": {
+      "type": "object",
+      "required": [
+        "size_bytes",
+        "sha256",
+        "architecture"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "sha256_verified_during_pack": {
+          "type": "boolean"
+        },
+        "architecture": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "tensor_adapter": {
+      "type": "object"
+    },
+    "topology": {
+      "type": "object"
+    },
+    "pack": {
+      "type": "object",
+      "required": [
+        "path",
+        "size_bytes",
+        "sha256",
+        "read_only"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "file_name": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "read_only": {
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "object_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "objects": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/object"
+      }
+    },
+    "verification": {
+      "type": "object",
+      "required": [
+        "valid",
+        "objects_checked",
+        "parts_checked",
+        "pack_bytes_checked"
+      ],
+      "properties": {
+        "valid": {
+          "const": true
+        },
+        "objects_checked": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "parts_checked": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pack_bytes_checked": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "source_bytes_checked": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "part": {
+      "type": "object",
+      "required": [
+        "part",
+        "tensor_name",
+        "tensor_type",
+        "source_offset",
+        "pack_offset",
+        "valid_length",
+        "sha256"
+      ],
+      "properties": {
+        "part": {
+          "enum": [
+            "up",
+            "gate",
+            "down",
+            "gate_up"
+          ]
+        },
+        "tensor_name": {
+          "type": "string"
+        },
+        "tensor_type": {
+          "type": "string"
+        },
+        "shape": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "source_offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pack_offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "valid_length": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "object": {
+      "type": "object",
+      "required": [
+        "layer",
+        "expert",
+        "offset",
+        "valid_length",
+        "padded_length",
+        "padding_length",
+        "valid_sha256",
+        "parts"
+      ],
+      "properties": {
+        "layer": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expert": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "valid_length": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "padded_length": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "padding_length": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "valid_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "parts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/part"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

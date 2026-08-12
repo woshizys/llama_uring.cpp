@@ -8,6 +8,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-expert-manager.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -2206,6 +2207,21 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
+        // External MoE weights have no resident buffer from which the generic
+        // scheduler can infer placement.  Bind routed expert matmuls to the
+        // layer device explicitly; the runtime callback supplies the weights.
+        if (il >= 0 && cur->op == GGML_OP_MUL_MAT_ID &&
+            cur->src[0] != nullptr && (cur->src[0]->flags & GGML_TENSOR_FLAG_EXTERNAL)) {
+            const auto & dev_layer = model.dev_layer(il);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_layer &&
+                    ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                    break;
+                }
+            }
+        }
+
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
@@ -2280,6 +2296,45 @@ public:
 private:
     uint8_t * ptr;
     size_t buf_size = 0;
+    size_t size_written = 0;
+};
+
+class llama_io_write_vector : public llama_io_write_i {
+public:
+    explicit llama_io_write_vector(std::vector<uint8_t> & buffer) : buffer(buffer) {}
+
+    void write(const void * src, size_t size) override {
+        if (size == 0) {
+            return;
+        }
+        if (size > std::numeric_limits<size_t>::max() - buffer.size()) {
+            throw std::runtime_error("state vector size overflow");
+        }
+        const size_t old_size = buffer.size();
+        buffer.resize(old_size + size);
+        memcpy(buffer.data() + old_size, src, size);
+        size_written += size;
+    }
+
+    void write_tensor(const ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size == 0) {
+            return;
+        }
+        if (size > std::numeric_limits<size_t>::max() - buffer.size()) {
+            throw std::runtime_error("state vector size overflow");
+        }
+        const size_t old_size = buffer.size();
+        buffer.resize(old_size + size);
+        ggml_backend_tensor_get(tensor, buffer.data() + old_size, offset, size);
+        size_written += size;
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    std::vector<uint8_t> & buffer;
     size_t size_written = 0;
 };
 
@@ -2545,6 +2600,34 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     return res;
 }
 
+
+size_t llama_context::state_seq_save_file_p4(
+        llama_seq_id seq_id,
+        const char * filepath,
+        const llama_token * tokens,
+        size_t n_token_count) {
+    if (model.expert_manager == nullptr) {
+        throw std::runtime_error("P4 KV save requires an initialized expert manager");
+    }
+
+    std::vector<uint8_t> data;
+    llama_io_write_vector header_io(data);
+    const uint32_t magic = LLAMA_STATE_SEQ_MAGIC;
+    const uint32_t version = LLAMA_STATE_SEQ_VERSION;
+    const uint32_t token_count = (uint32_t) n_token_count;
+    header_io.write(&magic, sizeof(magic));
+    header_io.write(&version, sizeof(version));
+    header_io.write(&token_count, sizeof(token_count));
+    header_io.write(tokens, sizeof(llama_token) * n_token_count);
+
+    llama_io_write_vector state_io(data);
+    state_seq_write_data(state_io, seq_id, 0);
+    GGML_ASSERT(
+            data.size() ==
+            sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + state_io.n_bytes());
+
+    return model.expert_manager->write_background_file(filepath, data, seq_id);
+}
 size_t llama_context::state_write_data(llama_io_write_i & io) {
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
@@ -3420,6 +3503,17 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
         return ctx->state_seq_save_file(seq_id, filepath, tokens, n_token_count);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_save_file_p4(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_save_file_p4(seq_id, filepath, tokens, n_token_count);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving sequence state file through P4: %s\n", __func__, err.what());
         return 0;
     }
 }

@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pdcat.local/schema/io-event-v1.json",
+  "title": "PDCat unified expert lifecycle/KV I/O event",
+  "type": "object",
+  "required": [
+    "event",
+    "operation",
+    "run_id",
+    "request_id",
+    "token_id",
+    "layer_id",
+    "phase",
+    "logical_expert_id",
+    "physical_slot",
+    "slot_generation",
+    "object_id",
+    "kv_slot_id",
+    "durable",
+    "request_class",
+    "predicted_probability",
+    "predicted_deadline_ns",
+    "submit_ns",
+    "cqe_ns",
+    "ready_ns",
+    "use_ns",
+    "offset",
+    "useful_bytes",
+    "issued_bytes",
+    "queue_depth",
+    "device_queue_depth",
+    "in_flight_bytes",
+    "cache_hit",
+    "prediction_hit",
+    "ready_before_deadline",
+    "direct_use",
+    "promoted",
+    "evicted",
+    "blocked_ns",
+    "router_us",
+    "predictor_us",
+    "attention_us",
+    "ffn_us",
+    "layer_us",
+    "success",
+    "error"
+  ],
+  "properties": {
+    "event": { "enum": ["expert_io", "expert_use", "kv_io"] },
+    "operation": { "enum": ["read", "use", "write", "fdatasync", "fsync"] },
+    "run_id": { "type": "string" },
+    "request_id": { "type": "string" },
+    "token_id": { "type": ["integer", "null"], "minimum": 0 },
+    "layer_id": { "type": ["integer", "null"], "minimum": 0 },
+    "phase": {
+      "enum": ["prefill", "decode", "demand", "promotion", "background"]
+    },
+    "logical_expert_id": { "type": ["integer", "null"], "minimum": 0 },
+    "physical_slot": { "type": ["integer", "null"], "minimum": 0 },
+    "slot_generation": { "type": ["integer", "null"], "minimum": 0 },
+    "object_id": { "type": ["string", "null"] },
+    "kv_slot_id": { "type": ["integer", "null"], "minimum": 0 },
+    "durable": { "type": ["boolean", "null"] },
+    "request_class": {
+      "enum": [
+        "p0-demand",
+        "p0-use",
+        "p1-mandatory",
+        "p2-speculative",
+        "p3-promotion",
+        "p4-background"
+      ]
+    },
+    "predicted_probability": { "type": ["number", "null"] },
+    "predicted_deadline_ns": { "type": ["integer", "null"], "minimum": 0 },
+    "submit_ns": { "type": "integer", "minimum": 0 },
+    "cqe_ns": { "type": "integer", "minimum": 0 },
+    "ready_ns": { "type": "integer", "minimum": 0 },
+    "use_ns": { "type": ["integer", "null"], "minimum": 0 },
+    "offset": { "type": ["integer", "null"], "minimum": 0 },
+    "useful_bytes": { "type": "integer", "minimum": 0 },
+    "issued_bytes": { "type": "integer", "minimum": 0 },
+    "queue_depth": { "type": "integer", "minimum": 0 },
+    "device_queue_depth": { "type": "integer", "minimum": 0 },
+    "in_flight_bytes": { "type": "integer", "minimum": 0 },
+    "cache_hit": { "type": "boolean" },
+    "prediction_hit": { "type": "boolean" },
+    "ready_before_deadline": { "type": ["boolean", "null"] },
+    "direct_use": { "type": "boolean" },
+    "promoted": { "type": "boolean" },
+    "evicted": { "type": ["boolean", "null"] },
+    "blocked_ns": { "type": "integer", "minimum": 0 },
+    "router_us": { "type": ["number", "null"] },
+    "predictor_us": { "type": ["number", "null"] },
+    "attention_us": { "type": ["number", "null"] },
+    "ffn_us": { "type": ["number", "null"] },
+    "layer_us": { "type": ["number", "null"] },
+    "success": { "type": "boolean" },
+    "error": { "type": ["string", "null"] }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "event": { "const": "expert_io" } } },
+      "then": {
+        "properties": {
+          "operation": { "const": "read" },
+          "layer_id": { "type": "integer", "minimum": 0 },
+          "logical_expert_id": { "type": "integer", "minimum": 0 },
+          "kv_slot_id": { "type": "null" },
+          "durable": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event": { "const": "expert_use" } } },
+      "then": {
+        "properties": {
+          "operation": { "const": "use" },
+          "layer_id": { "type": "integer", "minimum": 0 },
+          "logical_expert_id": { "type": "integer", "minimum": 0 },
+          "physical_slot": { "type": "integer", "minimum": 0 },
+          "slot_generation": { "type": "integer", "minimum": 0 },
+          "kv_slot_id": { "type": "null" },
+          "durable": { "type": "null" },
+          "request_class": { "const": "p0-use" },
+          "use_ns": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event": { "const": "kv_io" } } },
+      "then": {
+        "properties": {
+          "operation": { "enum": ["write", "fdatasync", "fsync"] },
+          "layer_id": { "type": "null" },
+          "logical_expert_id": { "type": "null" },
+          "physical_slot": { "type": "null" },
+          "slot_generation": { "type": "null" },
+          "kv_slot_id": { "type": "integer", "minimum": 0 },
+          "durable": { "type": "boolean" },
+          "request_class": { "const": "p4-background" }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

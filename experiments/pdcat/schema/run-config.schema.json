@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pdcat.local/schema/run-config-v1.json",
+  "title": "PDCat experiment run configuration",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "experiment_id",
+    "model",
+    "command",
+    "workload",
+    "default_profile",
+    "profiles"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "experiment_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "primary_model": {
+      "type": "boolean"
+    },
+    "model": {
+      "type": "object",
+      "required": [
+        "path",
+        "sha256",
+        "gguf_architecture",
+        "expected_topology",
+        "tensor_adapter"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "gguf_architecture": {
+          "type": "string",
+          "minLength": 1
+        },
+        "quantization": {
+          "type": "string"
+        },
+        "expected_topology": {
+          "type": "object"
+        },
+        "tensor_adapter": {
+          "type": "object",
+          "required": [
+            "name",
+            "tensor_pattern",
+            "expert_axis",
+            "part_order"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tensor_pattern": {
+              "type": "string",
+              "minLength": 1
+            },
+            "expert_axis": {
+              "type": "integer"
+            },
+            "part_order": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": true
+        },
+        "expert_pack": {
+          "type": "object",
+          "required": [
+            "manifest",
+            "manifest_sha256",
+            "path",
+            "sha256",
+            "size_bytes",
+            "alignment",
+            "object_count"
+          ],
+          "properties": {
+            "manifest": {
+              "type": "string",
+              "minLength": 1
+            },
+            "manifest_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{64}$"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{64}$"
+            },
+            "size_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "alignment": {
+              "type": "integer",
+              "minimum": 4096
+            },
+            "object_count": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "command": {
+      "type": "object",
+      "required": [
+        "binary",
+        "base_args"
+      ],
+      "properties": {
+        "binary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "base_args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "environment": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": true
+    },
+    "workload": {
+      "type": "object",
+      "required": [
+        "prompt",
+        "n_predict"
+      ],
+      "properties": {
+        "prompt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "n_predict": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "default_profile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "profiles": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "args"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "environment": {
+            "type": "object"
+          },
+          "use_expert_pack": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

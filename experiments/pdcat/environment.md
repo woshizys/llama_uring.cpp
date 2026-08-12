@@ -1,10 +1,10 @@
 # PDCat experiment environment
 
-- Collected at (UTC): `2026-08-11T14:35:48.428591+00:00`
+- Collected at (UTC): `2026-08-11T16:37:02.811269+00:00`
 - Device: NVIDIA Jetson Orin NX Engineering Reference Developer Kit
 - Architecture/kernel: `aarch64 / 5.15.148-tegra`
 - L4T: `# R36 (release), REVISION: 4.4, GCID: 41062509, BOARD: generic, EABI: aarch64, DATE: Mon Jun 16 16:07:13 UTC 2025`
-- Memory total/available: 15655.6 MiB / 13663.2 MiB
+- Memory total/available: 15655.6 MiB / 12484.5 MiB
 
 ## Software
 
@@ -21,9 +21,9 @@
 
 | Repository | Branch | Commit | Dirty |
 | --- | --- | --- | --- |
-| `/workspace/llama_uring.cpp` | `feat/pdcat` | `413e0c3cd35273cc69d4f5cbd0bbd0918d0f0d21` | yes |
-| `/workspace/InterfaceIO` | `feat/pdcat` | `8229dc1b4a6a26b70f3f8a4ee7f83e0e68b6179a` | yes |
-| `/workspace/EK-Edge` | `feat/pdcat` | `77ee8265ad39b1c89ca3b9c0a8f52e9f6766f796` | yes |
+| `/workspace/llama_uring.cpp` | `feat/pdcat` | `3005b9b92bd054043d5435ed015a0c9a3fa2ad93` | yes |
+| `/workspace/InterfaceIO` | `feat/pdcat` | `f0e00c5cfdddba662f4a31f84d8c7bf13e49e8fe` | yes |
+| `/workspace/EK-Edge` | `feat/pdcat` | `b50ef59f3c4f0c988af27df57788f5c68dd16d87` | yes |
 
 ## NVMe
 

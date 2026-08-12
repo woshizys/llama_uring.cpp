@@ -57,6 +57,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data(
     mparams_copy.use_mmap  = false;
     mparams_copy.use_mlock = false;
     mparams_copy.expert_cache_capacity = 0;
+    mparams_copy.expert_pack_manifest = nullptr;
 
     llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
     if (model == nullptr) {
@@ -474,6 +475,7 @@ static void common_params_fit_impl(
             const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) -> std::vector<int64_t> {
         llama_model_params mparams_copy = *mparams;
         mparams_copy.expert_cache_capacity = 0;
+        mparams_copy.expert_pack_manifest = nullptr;
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
         const dmds_t dmd_nl = common_get_device_memory_data(

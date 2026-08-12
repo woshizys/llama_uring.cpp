@@ -1,0 +1,44 @@
+{
+  "dataset_id": "pdcat-deepseek-v2-lite-prompts-v1",
+  "files": {
+    "gate_a_100.jsonl": {
+      "rows": 100,
+      "sha256": "d47f5960a3519b81349a12c3e5c548e047e2719aa0e95200df2b034cf937396b"
+    },
+    "predictor_train_validation_100.jsonl": {
+      "rows": 100,
+      "sha256": "52d76af69be0ef5dee347855d154794f8c69a489f61dd9bb9cf403be6032c4b4"
+    },
+    "prompt_pool_200.jsonl": {
+      "rows": 200,
+      "sha256": "6a63188b09c0eef3b6463aa00209640fa516baf111b6cc1b577e583a1d8ad3e0"
+    }
+  },
+  "prompt_hash_overlap_across_splits": 0,
+  "schema_version": 1,
+  "selection": {
+    "algorithm": "ascending sha256(seed\\0source_id\\0prompt_sha256)",
+    "real_prompts": 180,
+    "seed": "pdcat-v0.3-prompt-split-2026-08-11",
+    "synthetic_prompts": 20
+  },
+  "source": {
+    "gate_a_real_character_length": [
+      8,
+      96
+    ],
+    "normalization": "collapse whitespace and strip",
+    "path": "/data/dataset/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json",
+    "selection_field": "first human turn",
+    "sha256": "014bcc3352fd62df5bbb7fb8af9b4fd12f87bb8a2b48a147789f245176ac8e4f",
+    "train_validation_character_length": [
+      32,
+      1024
+    ]
+  },
+  "split_counts": {
+    "test": 100,
+    "train": 80,
+    "validation": 20
+  }
+}

@@ -1,0 +1,619 @@
+{
+  "schema_version": 1,
+  "collected_at_utc": "2026-08-11T16:37:02.811269+00:00",
+  "platform": {
+    "device_model": "NVIDIA Jetson Orin NX Engineering Reference Developer Kit",
+    "l4t_release": "# R36 (release), REVISION: 4.4, GCID: 41062509, BOARD: generic, EABI: aarch64, DATE: Mon Jun 16 16:07:13 UTC 2025\n# KERNEL_VARIANT: oot\nTARGET_USERSPACE_LIB_DIR=nvidia\nTARGET_USERSPACE_LIB_DIR_PATH=usr/lib/aarch64-linux-gnu/nvidia",
+    "os_release": {
+      "PRETTY_NAME": "Ubuntu 24.04.2 LTS",
+      "NAME": "Ubuntu",
+      "VERSION_ID": "24.04",
+      "VERSION": "24.04.2 LTS (Noble Numbat)",
+      "VERSION_CODENAME": "noble",
+      "ID": "ubuntu",
+      "ID_LIKE": "debian",
+      "HOME_URL": "https://www.ubuntu.com/",
+      "SUPPORT_URL": "https://help.ubuntu.com/",
+      "BUG_REPORT_URL": "https://bugs.launchpad.net/ubuntu/",
+      "PRIVACY_POLICY_URL": "https://www.ubuntu.com/legal/terms-and-policies/privacy-policy",
+      "UBUNTU_CODENAME": "noble",
+      "LOGO": "ubuntu-logo"
+    },
+    "kernel": "5.15.148-tegra",
+    "uname": "Linux 1afe529a488c 5.15.148-tegra #1 SMP PREEMPT Mon Jun 16 08:24:48 PDT 2025 aarch64 aarch64",
+    "architecture": "aarch64",
+    "cpu_count": 8,
+    "memory": {
+      "MemTotal": 16416063488,
+      "MemFree": 505884672,
+      "MemAvailable": 13090942976,
+      "Buffers": 274329600,
+      "Cached": 12462870528,
+      "SwapCached": 208896,
+      "Active": 10181734400,
+      "Inactive": 3204501504,
+      "Active(anon)": 116228096,
+      "Inactive(anon)": 679522304,
+      "Active(file)": 10065506304,
+      "Inactive(file)": 2524979200,
+      "Unevictable": 36249600,
+      "Mlocked": 0,
+      "SwapTotal": 8208023552,
+      "SwapFree": 7689502720,
+      "Dirty": 2473984,
+      "Writeback": 0,
+      "AnonPages": 669306880,
+      "Mapped": 386564096,
+      "Shmem": 110456832,
+      "KReclaimable": 254693376,
+      "Slab": 390852608,
+      "SReclaimable": 254693376,
+      "SUnreclaim": 136159232,
+      "KernelStack": 11722752,
+      "PageTables": 19853312,
+      "NFS_Unstable": 0,
+      "Bounce": 0,
+      "WritebackTmp": 0,
+      "CommitLimit": 16416055296,
+      "Committed_AS": 5560213504,
+      "VmallocTotal": 136339039191040,
+      "VmallocUsed": 101801984,
+      "VmallocChunk": 0,
+      "Percpu": 6979584,
+      "HardwareCorrupted": 0,
+      "AnonHugePages": 251658240,
+      "ShmemHugePages": 0,
+      "ShmemPmdMapped": 0,
+      "FileHugePages": 0,
+      "FilePmdMapped": 0,
+      "CmaTotal": 268435456,
+      "CmaFree": 1224704,
+      "HugePages_Total": 0,
+      "HugePages_Free": 0,
+      "HugePages_Rsvd": 0,
+      "HugePages_Surp": 0,
+      "Hugepagesize": 2097152,
+      "Hugetlb": 0
+    }
+  },
+  "software": {
+    "nvcc": {
+      "command": [
+        "/usr/local/cuda/bin/nvcc",
+        "--version"
+      ],
+      "available": true,
+      "returncode": 0,
+      "stdout": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Fri_Feb_21_20:24:58_PST_2025\nCuda compilation tools, release 12.8, V12.8.93\nBuild cuda_12.8.r12.8/compiler.35583870_0",
+      "stderr": "",
+      "version": "nvcc: NVIDIA (R) Cuda compiler driver"
+    },
+    "gcc": {
+      "command": [
+        "/usr/bin/gcc",
+        "--version"
+      ],
+      "available": true,
+      "returncode": 0,
+      "stdout": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+      "stderr": "",
+      "version": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0"
+    },
+    "gxx": {
+      "command": [
+        "/usr/bin/g++",
+        "--version"
+      ],
+      "available": true,
+      "returncode": 0,
+      "stdout": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+      "stderr": "",
+      "version": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0"
+    },
+    "cmake": {
+      "command": [
+        "/opt/venv/bin/cmake",
+        "--version"
+      ],
+      "available": true,
+      "returncode": 0,
+      "stdout": "cmake version 3.31.6\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).",
+      "stderr": "",
+      "version": "cmake version 3.31.6"
+    },
+    "rustc": {
+      "command": [
+        "/root/.cargo/bin/rustc",
+        "--version"
+      ],
+      "available": true,
+      "returncode": 0,
+      "stdout": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+      "stderr": "",
+      "version": "rustc 1.92.0 (ded5c06cf 2025-12-08)"
+    },
+    "cargo": {
+      "command": [
+        "/root/.cargo/bin/cargo",
+        "--version"
+      ],
+      "available": true,
+      "returncode": 0,
+      "stdout": "cargo 1.92.0 (344c4567c 2025-10-21)",
+      "stderr": "warning: `/root/.cargo/config` is deprecated in favor of `config.toml`\n  |\n  = help: if you need to support cargo 1.38 or earlier, you can symlink `config` to `config.toml`",
+      "version": "cargo 1.92.0 (344c4567c 2025-10-21)"
+    }
+  },
+  "power_and_clocks": {
+    "nvpmodel": {
+      "command": [
+        "nvpmodel",
+        "-q"
+      ],
+      "available": false
+    },
+    "jetson_clocks": {
+      "command": [
+        "jetson_clocks",
+        "--show"
+      ],
+      "available": false
+    }
+  },
+  "storage": {
+    "workspace_mount": {
+      "filesystems": [
+        {
+          "target": "/workspace",
+          "source": "/dev/nvme0n1p1[/home/kural]",
+          "fstype": "ext4",
+          "options": "rw,relatime"
+        }
+      ]
+    },
+    "data_mount": {
+      "filesystems": [
+        {
+          "target": "/data",
+          "source": "/dev/nvme1n1p1",
+          "fstype": "ext4",
+          "options": "rw,relatime"
+        }
+      ]
+    },
+    "block_devices": {
+      "blockdevices": [
+        {
+          "name": "loop0",
+          "model": null,
+          "fstype": null,
+          "size": 4096,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop1",
+          "model": null,
+          "fstype": null,
+          "size": 197668864,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop2",
+          "model": null,
+          "fstype": null,
+          "size": 200417280,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop3",
+          "model": null,
+          "fstype": null,
+          "size": 72294400,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop4",
+          "model": null,
+          "fstype": null,
+          "size": 72310784,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop5",
+          "model": null,
+          "fstype": null,
+          "size": 64909312,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop6",
+          "model": null,
+          "fstype": null,
+          "size": 64864256,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop7",
+          "model": null,
+          "fstype": null,
+          "size": 48910336,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop8",
+          "model": null,
+          "fstype": null,
+          "size": 50204672,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop9",
+          "model": null,
+          "fstype": null,
+          "size": 527392768,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop10",
+          "model": null,
+          "fstype": null,
+          "size": 527577088,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop11",
+          "model": null,
+          "fstype": null,
+          "size": 579809280,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop12",
+          "model": null,
+          "fstype": null,
+          "size": 96141312,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop13",
+          "model": null,
+          "fstype": null,
+          "size": 183046144,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop14",
+          "model": null,
+          "fstype": null,
+          "size": 197390336,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop15",
+          "model": null,
+          "fstype": null,
+          "size": 46415872,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop16",
+          "model": null,
+          "fstype": null,
+          "size": 43622400,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "loop17",
+          "model": null,
+          "fstype": null,
+          "size": 16777216,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "zram0",
+          "model": null,
+          "fstype": null,
+          "size": 1026007040,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "zram1",
+          "model": null,
+          "fstype": null,
+          "size": 1026007040,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "zram2",
+          "model": null,
+          "fstype": null,
+          "size": 1026007040,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "zram3",
+          "model": null,
+          "fstype": null,
+          "size": 1026007040,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "zram4",
+          "model": null,
+          "fstype": null,
+          "size": 1026007040,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "zram5",
+          "model": null,
+          "fstype": null,
+          "size": 1026007040,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "zram6",
+          "model": null,
+          "fstype": null,
+          "size": 1026007040,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "zram7",
+          "model": null,
+          "fstype": null,
+          "size": 1026007040,
+          "fsavail": null,
+          "fsuse%": null
+        },
+        {
+          "name": "nvme0n1",
+          "model": "aigo NVMe SSD DP35 256GB",
+          "fstype": null,
+          "size": 256060514304,
+          "fsavail": null,
+          "fsuse%": null,
+          "children": [
+            {
+              "name": "nvme0n1p1",
+              "model": null,
+              "fstype": null,
+              "size": 254498869248,
+              "fsavail": 67146485760,
+              "fsuse%": "68%"
+            },
+            {
+              "name": "nvme0n1p2",
+              "model": null,
+              "fstype": null,
+              "size": 134217728,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p3",
+              "model": null,
+              "fstype": null,
+              "size": 786432,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p4",
+              "model": null,
+              "fstype": null,
+              "size": 33161216,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p5",
+              "model": null,
+              "fstype": null,
+              "size": 134217728,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p6",
+              "model": null,
+              "fstype": null,
+              "size": 786432,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p7",
+              "model": null,
+              "fstype": null,
+              "size": 33161216,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p8",
+              "model": null,
+              "fstype": null,
+              "size": 83886080,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p9",
+              "model": null,
+              "fstype": null,
+              "size": 524288,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p10",
+              "model": null,
+              "fstype": null,
+              "size": 67108864,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p11",
+              "model": null,
+              "fstype": null,
+              "size": 83886080,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p12",
+              "model": null,
+              "fstype": null,
+              "size": 524288,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p13",
+              "model": null,
+              "fstype": null,
+              "size": 67108864,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p14",
+              "model": null,
+              "fstype": null,
+              "size": 419430400,
+              "fsavail": null,
+              "fsuse%": null
+            },
+            {
+              "name": "nvme0n1p15",
+              "model": null,
+              "fstype": null,
+              "size": 502792192,
+              "fsavail": null,
+              "fsuse%": null
+            }
+          ]
+        },
+        {
+          "name": "nvme1n1",
+          "model": "Acer SSD N5000M 512GB                   ",
+          "fstype": null,
+          "size": 512110190592,
+          "fsavail": null,
+          "fsuse%": null,
+          "children": [
+            {
+              "name": "nvme1n1p1",
+              "model": null,
+              "fstype": null,
+              "size": 512108789760,
+              "fsavail": 195961434112,
+              "fsuse%": "56%"
+            }
+          ]
+        }
+      ]
+    },
+    "nvme_controllers": [
+      {
+        "name": "nvme0",
+        "model": "aigo NVMe SSD DP35 256GB",
+        "firmware_revision": "SN13321",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "4",
+        "max_link_speed": "8.0 GT/s PCIe",
+        "max_link_width": "4"
+      },
+      {
+        "name": "nvme1",
+        "model": "Acer SSD N5000M 512GB",
+        "firmware_revision": "X0430L",
+        "current_link_speed": "16.0 GT/s PCIe",
+        "current_link_width": "2",
+        "max_link_speed": "16.0 GT/s PCIe",
+        "max_link_width": "4"
+      }
+    ]
+  },
+  "repositories": [
+    {
+      "path": "/workspace/llama_uring.cpp",
+      "branch": "feat/pdcat",
+      "commit": "3005b9b92bd054043d5435ed015a0c9a3fa2ad93",
+      "origin": "git@github.com:woshizys/llama_uring.cpp.git",
+      "dirty": true,
+      "working_tree": [
+        "M .gitignore",
+        " M tools/collect_pdcat_environment.py",
+        "?? experiments/pdcat/README.md",
+        "?? experiments/pdcat/configs/",
+        "?? experiments/pdcat/environment.json",
+        "?? experiments/pdcat/schema/",
+        "?? tools/collect_pdcat_environment.py.orig",
+        "?? tools/pdcat_model.py",
+        "?? tools/run_pdcat_experiment.py"
+      ]
+    },
+    {
+      "path": "/workspace/InterfaceIO",
+      "branch": "feat/pdcat",
+      "commit": "f0e00c5cfdddba662f4a31f84d8c7bf13e49e8fe",
+      "origin": "git@github.com:woshizys/InterfaceIO.git",
+      "dirty": true,
+      "working_tree": [
+        "?? preflight_launcher/bin/"
+      ]
+    },
+    {
+      "path": "/workspace/EK-Edge",
+      "branch": "feat/pdcat",
+      "commit": "b50ef59f3c4f0c988af27df57788f5c68dd16d87",
+      "origin": "git@github.com:expert-kit/EK-Edge.git",
+      "dirty": true,
+      "working_tree": [
+        "?? .codex",
+        "?? tmp/"
+      ]
+    }
+  ],
+  "models": [
+    {
+      "path": "/data/models/DeepSeek-V2-Lite-GGUF/DeepSeek-V2-Lite-Q8_0.gguf",
+      "exists": true,
+      "kind": "file",
+      "size_bytes": 16702520096,
+      "sha256": "7b131e7fdddd10eeca4d1716832de9aaa60ff2544a94bec13cb34946bec514b0"
+    }
+  ],
+  "notes": [
+    "Power/clock commands are unavailable in this container; record nvpmodel and jetson_clocks on the host before final runs.",
+    "Record GGUF architecture, quantization, layers, experts, top-k, and expert byte layout in the run configuration."
+  ]
+}

@@ -544,6 +544,8 @@ struct common_params {
     bool use_mmap          = true;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering
     size_t expert_cache_capacity       = 0;  // MoE expert cache slots, 0 disables expert cache
+    std::string expert_pack_manifest   = ""; // aligned Expert sidecar manifest
+    bool pdcat_kv_p4                   = false; // route server slot saves through P4 scheduler
     bool use_mlock         = false; // use mlock to keep model in memory
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation

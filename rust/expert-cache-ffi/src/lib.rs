@@ -4,12 +4,15 @@ use io_scheduler::expert_manager::{
     ExpertHandle as SchedulerExpertHandle, ExpertKey, ExpertTicket as SchedulerExpertTicket,
     LlamaExpertManager, MoePart, Slice, TensorLayout, TensorLayoutKind, TensorMeta,
 };
+use io_scheduler::predictor::{
+    ExpertPredictor, LowRankMlpPredictor, ParsedExpertKey, PredictionRequest, TraceBasedPredictor,
+};
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::runtime::{Builder, Handle, Runtime};
 
 #[repr(C)]
@@ -19,6 +22,15 @@ pub struct llama_expert_slice_ffi {
     pub file_id: i32,
     pub file_offset: u64,
     pub file_size: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct llama_expert_prediction_ffi {
+    pub layer: i32,
+    pub expert: i32,
+    pub probability: f32,
+    pub deadline_ns: u64,
 }
 
 #[derive(Debug)]
@@ -34,8 +46,12 @@ pub enum ExpertCacheError {
     NullSlice,
     NullLayoutParts,
     NullPath,
+    NullData,
+    NullWrittenOut,
     NullExperts,
     NullExpertOut,
+    NullPredictions,
+    NullLayerOut,
     NullHandles,
     Backend(String),
     Panic,
@@ -57,21 +73,91 @@ impl std::fmt::Display for ExpertCacheError {
             Self::NullSlice => write!(f, "null expert slice pointer"),
             Self::NullLayoutParts => write!(f, "null tensor layout parts pointer"),
             Self::NullPath => write!(f, "null expert file path pointer"),
+            Self::NullData => write!(f, "null KV state data pointer"),
+            Self::NullWrittenOut => write!(f, "null KV written output pointer"),
             Self::NullExperts => write!(f, "null expert ids pointer"),
             Self::NullExpertOut => write!(f, "null output expert pointer"),
             Self::NullHandles => write!(f, "null output handles pointer"),
             Self::Backend(msg) => write!(f, "{msg}"),
             Self::Panic => write!(f, "panic crossed FFI boundary"),
+            Self::NullPredictions => write!(f, "null output predictions pointer"),
+            Self::NullLayerOut => write!(f, "null output layer pointer"),
         }
     }
 }
 
 impl std::error::Error for ExpertCacheError {}
+fn predictor_from_env() -> Result<Box<dyn ExpertPredictor>, ExpertCacheError> {
+    let top_k = std::env::var("PDCAT_PREDICTOR_TOP_K")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(256);
+    if let Some(path) = std::env::var_os("PDCAT_PREDICTOR_MANIFEST") {
+        let predictor = LowRankMlpPredictor::from_manifest(&path, top_k)
+            .map_err(|error| ExpertCacheError::Backend(error.to_string()))?;
+        let expected_model_id = std::env::var("PDCAT_MODEL_ID").map_err(|_| {
+            ExpertCacheError::Backend(
+                "PDCAT_MODEL_ID is required with PDCAT_PREDICTOR_MANIFEST".to_string(),
+            )
+        })?;
+        let expected_model_sha256 = std::env::var("PDCAT_MODEL_SHA256").map_err(|_| {
+            ExpertCacheError::Backend(
+                "PDCAT_MODEL_SHA256 is required with PDCAT_PREDICTOR_MANIFEST".to_string(),
+            )
+        })?;
+        let expected_num_experts = std::env::var("PDCAT_MODEL_EXPERT_COUNT")
+            .map_err(|_| {
+                ExpertCacheError::Backend(
+                    "PDCAT_MODEL_EXPERT_COUNT is required with PDCAT_PREDICTOR_MANIFEST"
+                        .to_string(),
+                )
+            })?
+            .parse::<usize>()
+            .map_err(|_| {
+                ExpertCacheError::Backend(
+                    "PDCAT_MODEL_EXPERT_COUNT must be a positive integer".to_string(),
+                )
+            })?;
+        let manifest = predictor.manifest();
+        if manifest.model_id != expected_model_id {
+            return Err(ExpertCacheError::Backend(format!(
+                "predictor model_id {} does not match current model {}",
+                manifest.model_id, expected_model_id
+            )));
+        }
+        if manifest
+            .model_sha256
+            .as_deref()
+            .is_none_or(|value| !value.eq_ignore_ascii_case(&expected_model_sha256))
+        {
+            return Err(ExpertCacheError::Backend(
+                "predictor model SHA-256 does not match the current model".to_string(),
+            ));
+        }
+        if expected_num_experts == 0 || manifest.num_experts != expected_num_experts {
+            return Err(ExpertCacheError::Backend(format!(
+                "predictor expert count {} does not match current model {}",
+                manifest.num_experts, expected_num_experts
+            )));
+        }
+        eprintln!(
+            "[PDCAT][predictor-load] backend=safetensors-mlp model={} manifest={} layers={} experts={}",
+            predictor.manifest().model_id,
+            predictor.manifest_path().display(),
+            predictor.manifest().layers.len(),
+            predictor.manifest().num_experts,
+        );
+        return Ok(Box::new(predictor));
+    }
+    Ok(Box::new(TraceBasedPredictor::new(top_k)))
+}
 
 #[allow(non_camel_case_types)]
 pub struct llama_expert_manager_ffi {
     manager: LlamaExpertManager,
     runtime: Runtime,
+    predictor: Mutex<Box<dyn ExpertPredictor>>,
 }
 
 impl llama_expert_manager_ffi {
@@ -92,7 +178,11 @@ impl llama_expert_manager_ffi {
             LlamaExpertManager::new(capacity, hidden_dim, intermediate_dim, precision_bits)
         };
 
-        Ok(Self { manager, runtime })
+        Ok(Self {
+            manager,
+            runtime,
+            predictor: Mutex::new(predictor_from_env()?),
+        })
     }
 
     pub fn new_with_slot_size(capacity: usize, slot_size: usize) -> Result<Self, ExpertCacheError> {
@@ -121,7 +211,11 @@ impl llama_expert_manager_ffi {
             LlamaExpertManager::new_with_slot_size_and_layout(capacity, slot_size, layout)
         };
 
-        Ok(Self { manager, runtime })
+        Ok(Self {
+            manager,
+            runtime,
+            predictor: Mutex::new(predictor_from_env()?),
+        })
     }
 }
 
@@ -440,6 +534,63 @@ pub extern "C" fn llama_expert_manager_register_file(
     }
 }
 
+/// Writes one complete llama slot-state image through the shared P4 scheduler.
+///
+/// The input bytes are borrowed only for the duration of this call. On success,
+/// `written_out` receives exactly `data_size`.
+#[no_mangle]
+pub extern "C" fn llama_expert_manager_write_background_file(
+    manager: *mut llama_expert_manager_ffi,
+    path: *const c_char,
+    data: *const u8,
+    data_size: usize,
+    kv_slot_id: i32,
+    written_out: *mut usize,
+) -> i32 {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let manager = manager_mut(manager)?;
+        let path = path_from_ptr(path)?;
+        let _ = id_to_usize("kv_slot_id", kv_slot_id)?;
+        if data_size > 0 && data.is_null() {
+            return Err(ExpertCacheError::NullData);
+        }
+        if written_out.is_null() {
+            return Err(ExpertCacheError::NullWrittenOut);
+        }
+        let bytes = if data_size == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(data, data_size) }
+        };
+        let written = manager
+            .runtime
+            .block_on(manager.manager.write_background_file(
+                std::path::Path::new(path),
+                bytes,
+                kv_slot_id,
+            ))
+            .map_err(scheduler_error)?;
+        unsafe {
+            *written_out = written;
+        }
+        Ok(())
+    }));
+
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(error)) => {
+            set_last_error(error);
+            -1
+        }
+        Err(_) => {
+            set_last_error(ExpertCacheError::Panic);
+            -2
+        }
+    }
+}
+
 /// Ensures that an expert is resident and pinned.
 ///
 /// Returns null on failure; call `llama_expert_manager_last_error_message()`.
@@ -537,6 +688,264 @@ pub extern "C" fn llama_expert_manager_ensure_many(
     }
 }
 
+/// Submits speculative expert prefetches without waiting for I/O completion.
+///
+/// A later demand for the same expert promotes a queued prefetch to the demand
+/// queue. Return code is zero on successful admission.
+#[no_mangle]
+pub extern "C" fn llama_expert_manager_prefetch_many(
+    manager: *mut llama_expert_manager_ffi,
+    layer: i32,
+    experts: *const i32,
+    count: usize,
+) -> i32 {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let manager = manager_mut(manager)?;
+        if count > 0 && experts.is_null() {
+            return Err(ExpertCacheError::NullExperts);
+        }
+
+        let layer = id_to_usize("layer", layer)?;
+        let expert_ids = if count == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(experts, count) }
+        };
+        let keys = expert_ids
+            .iter()
+            .copied()
+            .map(|expert| Ok(ExpertKey::new(layer, id_to_usize("expert", expert)?)))
+            .collect::<Result<Vec<_>, ExpertCacheError>>()?;
+
+        manager
+            .runtime
+            .block_on(manager.manager.prefetch_many(keys))
+            .map_err(scheduler_error)
+    }));
+
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(error)) => {
+            set_last_error(error);
+            -1
+        }
+        Err(_) => {
+            set_last_error(ExpertCacheError::Panic);
+            -2
+        }
+    }
+}
+
+/// Schedules every expert from the next registered MoE layer as P1 mandatory
+/// staging. The next layer is discovered from model registration metadata, so
+/// non-consecutive MoE layouts do not require architecture-specific constants.
+#[no_mangle]
+pub extern "C" fn llama_expert_manager_prefetch_next_layer_mandatory(
+    manager: *mut llama_expert_manager_ffi,
+    current_layer: i32,
+    target_layer_out: *mut i32,
+) -> i32 {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let manager = manager_mut(manager)?;
+        if target_layer_out.is_null() {
+            return Err(ExpertCacheError::NullLayerOut);
+        }
+        let current_layer = id_to_usize("current layer", current_layer)?;
+        let scheduled = manager
+            .runtime
+            .block_on(manager.manager.prefetch_next_layer_mandatory(current_layer))
+            .map_err(scheduler_error)?;
+        let Some((target_layer, count)) = scheduled else {
+            unsafe { *target_layer_out = -1 };
+            return Ok(0);
+        };
+        unsafe {
+            *target_layer_out = i32::try_from(target_layer).map_err(|_| {
+                ExpertCacheError::Backend("target layer does not fit i32".to_string())
+            })?;
+        }
+        i32::try_from(count)
+            .map_err(|_| ExpertCacheError::Backend("expert count does not fit i32".to_string()))
+    }));
+
+    match result {
+        Ok(Ok(count)) => count,
+        Ok(Err(error)) => {
+            set_last_error(error);
+            -1
+        }
+        Err(_) => {
+            set_last_error(ExpertCacheError::Panic);
+            -2
+        }
+    }
+}
+
+/// Observes the native router output, predicts the next registered MoE layer,
+/// and admits every returned candidate as speculative prefetch. Prediction never
+/// changes the native router selection.
+#[no_mangle]
+pub extern "C" fn llama_expert_manager_predict_prefetch_next(
+    manager: *mut llama_expert_manager_ffi,
+    layer: i32,
+    experts: *const i32,
+    count: usize,
+    router_scores: *const f32,
+    max_predictions: usize,
+    current_token_id: u64,
+    deadline_ns: u64,
+    predictions_out: *mut llama_expert_prediction_ffi,
+    predictions_capacity: usize,
+) -> i32 {
+    clear_last_error();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let manager = manager_mut(manager)?;
+        if count > 0 && experts.is_null() {
+            return Err(ExpertCacheError::NullExperts);
+        }
+        if predictions_capacity > 0 && predictions_out.is_null() {
+            return Err(ExpertCacheError::NullPredictions);
+        }
+        if max_predictions == 0 || predictions_capacity == 0 {
+            return Ok(0);
+        }
+
+        let layer = id_to_usize("layer", layer)?;
+        manager.manager.set_metric_token_id(current_token_id);
+        let expert_ids = if count == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(experts, count) }
+        };
+        let current_router_scores = if router_scores.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(router_scores, count) }.to_vec()
+        };
+        let current_experts = expert_ids
+            .iter()
+            .copied()
+            .map(|expert| {
+                let expert = id_to_usize("expert", expert)?;
+                Ok(format!("runtime/l{layer}-e{expert}"))
+            })
+            .collect::<Result<Vec<_>, ExpertCacheError>>()?;
+        if current_experts.is_empty() {
+            return Ok(0);
+        }
+
+        let Some(next_layer) = manager
+            .runtime
+            .block_on(manager.manager.next_registered_layer_cyclic(layer))
+        else {
+            return Ok(0);
+        };
+        let registered = manager
+            .runtime
+            .block_on(manager.manager.registered_experts_for_layer(next_layer));
+        if registered.is_empty() {
+            return Ok(0);
+        }
+        let registered = registered
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let target_token_id = if next_layer <= layer {
+            current_token_id.checked_add(1).ok_or_else(|| {
+                ExpertCacheError::Backend("predictor token generation overflow".to_string())
+            })?
+        } else {
+            current_token_id
+        };
+
+        let predictor_started = std::time::Instant::now();
+        let raw_predictions = {
+            let mut predictor = manager.predictor.lock().map_err(|_| {
+                ExpertCacheError::Backend("online predictor mutex is poisoned".to_string())
+            })?;
+            predictor
+                .observe(Some("online"), layer, &current_experts)
+                .map_err(scheduler_error)?;
+            predictor
+                .predict_next(&PredictionRequest {
+                    request_id: Some("online".to_string()),
+                    current_layer: layer,
+                    target_layer: Some(next_layer),
+                    current_experts,
+                    current_router_scores,
+                    max_predictions: max_predictions.min(predictions_capacity),
+                })
+                .map_err(scheduler_error)?
+        };
+        let predictor_us = predictor_started.elapsed().as_secs_f64() * 1.0e6;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut admitted = Vec::new();
+        for prediction in raw_predictions {
+            if !prediction.score.is_finite() {
+                continue;
+            }
+            let parsed = ParsedExpertKey::parse(&prediction.expert_id).map_err(scheduler_error)?;
+            if parsed.layer != next_layer {
+                continue;
+            }
+            let key = ExpertKey::new(parsed.layer, parsed.expert);
+            if !registered.contains(&key) || !seen.insert(key) {
+                continue;
+            }
+            admitted.push((key, prediction.score));
+            if admitted.len() >= max_predictions.min(predictions_capacity) {
+                break;
+            }
+        }
+
+        if admitted.is_empty() {
+            return Ok(0);
+        }
+        manager
+            .runtime
+            .block_on(manager.manager.prefetch_predictions(
+                admitted.clone(),
+                deadline_ns,
+                predictor_us,
+                target_token_id,
+            ))
+            .map_err(scheduler_error)?;
+
+        let output =
+            unsafe { std::slice::from_raw_parts_mut(predictions_out, predictions_capacity) };
+        for (slot, (key, probability)) in output.iter_mut().zip(admitted.iter()) {
+            slot.layer = i32::try_from(key.layer()).map_err(|_| {
+                ExpertCacheError::Backend("predicted layer id does not fit i32".to_string())
+            })?;
+            slot.expert = i32::try_from(key.expert()).map_err(|_| {
+                ExpertCacheError::Backend("predicted expert id does not fit i32".to_string())
+            })?;
+            slot.probability = *probability;
+            slot.deadline_ns = deadline_ns;
+        }
+
+        i32::try_from(admitted.len())
+            .map_err(|_| ExpertCacheError::Backend("prediction count does not fit i32".to_string()))
+    }));
+
+    match result {
+        Ok(Ok(count)) => count,
+        Ok(Err(error)) => {
+            set_last_error(error);
+            -1
+        }
+        Err(_) => {
+            set_last_error(ExpertCacheError::Panic);
+            -2
+        }
+    }
+}
+
 /// Submits a batch of experts from the same layer for asynchronous loading.
 ///
 /// Returns null on failure; call `llama_expert_manager_last_error_message()`.
@@ -548,6 +957,7 @@ pub extern "C" fn llama_expert_manager_submit_batch_async(
     layer: i32,
     experts: *const i32,
     count: usize,
+    token_id: u64,
 ) -> *mut llama_expert_ticket_ffi {
     clear_last_error();
 
@@ -571,7 +981,11 @@ pub extern "C" fn llama_expert_manager_submit_batch_async(
 
         let ticket = manager
             .runtime
-            .block_on(manager.manager.submit_batch_async(keys))
+            .block_on(
+                manager
+                    .manager
+                    .submit_batch_async(keys, (token_id != u64::MAX).then_some(token_id)),
+            )
             .map_err(scheduler_error)?;
 
         Ok(llama_expert_ticket_ffi {

@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "matrix_id": "deepseek-v2-lite-v03-matrix",
+  "config": "../configs/deepseek-v2-lite-q8_0.json",
+  "prompt": "Explain how a bounded expert I/O scheduler should prioritize a router-confirmed miss over speculative prefetch and background KV writes on an edge device.",
+  "n_predict": 16,
+  "warmups": 1,
+  "repeats": 3,
+  "monitor": true,
+  "monitor_interval": 1.0,
+  "cases": [
+    {
+      "id": "native-mixed-baseline",
+      "profile": "native_mixed",
+      "warmups": 0,
+      "repeats": 1,
+      "extra_args": [],
+      "environment": {}
+    },
+    {
+      "id": "cache-cpu-baseline",
+      "profile": "cache_cpu",
+      "warmups": 0,
+      "repeats": 1,
+      "extra_args": [],
+      "environment": {}
+    },
+    {
+      "id": "demand-cap64-qd6",
+      "profile": "cache_mixed",
+      "extra_args": ["--expert-cache-capacity 64"],
+      "environment": {"PDCAT_IO_MAX_QD": 6}
+    },
+    {
+      "id": "demand-cap96-qd6",
+      "profile": "cache_mixed",
+      "extra_args": ["--expert-cache-capacity 96"],
+      "environment": {"PDCAT_IO_MAX_QD": 6}
+    },
+    {
+      "id": "demand-cap128-qd6",
+      "profile": "cache_mixed",
+      "extra_args": ["--expert-cache-capacity 128"],
+      "environment": {"PDCAT_IO_MAX_QD": 6}
+    },
+    {
+      "id": "prefill-stream-cap128",
+      "profile": "cache_mixed_prefill_stream",
+      "extra_args": ["--expert-cache-capacity 128"],
+      "environment": {}
+    },
+    {
+      "id": "history-top1",
+      "profile": "cache_mixed_predict_history",
+      "extra_args": [],
+      "environment": {"LLAMA_MOE_PREDICTOR_TOP_N": 1}
+    },
+    {
+      "id": "history-top2",
+      "profile": "cache_mixed_predict_history",
+      "extra_args": [],
+      "environment": {"LLAMA_MOE_PREDICTOR_TOP_N": 2}
+    },
+    {
+      "id": "history-top4",
+      "profile": "cache_mixed_predict_history",
+      "extra_args": [],
+      "environment": {"LLAMA_MOE_PREDICTOR_TOP_N": 4}
+    },
+    {
+      "id": "mlp-top2",
+      "profile": "cache_mixed_predict_mlp",
+      "extra_args": [],
+      "environment": {
+        "LLAMA_MOE_PREDICTOR_TOP_N": 2,
+        "PDCAT_PREDICTOR_TOP_K": 2
+      }
+    },
+    {
+      "id": "mapped-direct-use",
+      "profile": "cache_mixed",
+      "extra_args": [],
+      "environment": {}
+    },
+    {
+      "id": "promote-copy",
+      "profile": "cache_mixed_promote",
+      "extra_args": [],
+      "environment": {}
+    },
+    {
+      "id": "demand-qd1",
+      "profile": "cache_mixed",
+      "extra_args": [],
+      "environment": {"PDCAT_IO_MAX_QD": 1}
+    },
+    {
+      "id": "demand-qd2",
+      "profile": "cache_mixed",
+      "extra_args": [],
+      "environment": {"PDCAT_IO_MAX_QD": 2}
+    },
+    {
+      "id": "history-spec-budget-9m",
+      "profile": "cache_mixed_predict_history",
+      "extra_args": [],
+      "environment": {
+        "LLAMA_MOE_PREDICTOR_TOP_N": 2,
+        "PDCAT_IO_MAX_SPECULATIVE_BYTES": 9437184
+      }
+    },
+    {
+      "id": "history-spec-budget-36m",
+      "profile": "cache_mixed_predict_history",
+      "extra_args": [],
+      "environment": {
+        "LLAMA_MOE_PREDICTOR_TOP_N": 4,
+        "PDCAT_IO_MAX_SPECULATIVE_BYTES": 37748736
+      }
+    }
+  ]
+}

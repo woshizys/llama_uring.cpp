@@ -155,6 +155,12 @@ struct llama_context {
      const llama_token * tokens,
                 size_t   n_token_count);
 
+
+    size_t state_seq_save_file_p4(
+          llama_seq_id   seq_id,
+            const char * filepath,
+     const llama_token * tokens,
+                size_t   n_token_count);
     //
     // perf
     //

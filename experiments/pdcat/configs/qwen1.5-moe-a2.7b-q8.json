@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "experiment_id": "qwen1.5-moe-a2.7b-q8",
+  "primary_model": false,
+  "model": {
+    "path": "/data/models/qwen1.5moe-remoe/qwen1.5moe-q8.gguf",
+    "sha256": "4e676979a67033ccdfc0daacf893705e5b3063973b42056e48f287f04d80cb4a",
+    "size_bytes": 15226010912,
+    "gguf_architecture": "qwen2moe",
+    "quantization": "Q8_0",
+    "expected_topology": {
+      "block_count": 24,
+      "expert_count": 60,
+      "expert_used_count": 4,
+      "moe_layer_count": 24,
+      "parts": [
+        "down",
+        "gate",
+        "up"
+      ],
+      "expert_object_bytes": 9191424,
+      "expert_tensor_count": 72,
+      "expert_object_count": 1440
+    },
+    "tensor_adapter": {
+      "name": "gguf-ffn-exps-v1",
+      "tensor_pattern": "^blk\\.(?P<layer>\\d+)\\.ffn_(?P<part>gate_up|gate|down|up)_exps(?:\\.weight)?$",
+      "expert_axis": 2,
+      "part_order": [
+        "up",
+        "gate",
+        "down",
+        "gate_up"
+      ]
+    }
+  },
+  "command": {
+    "binary": "build-expert-cache/bin/llama-completion",
+    "base_args": [
+      "--seed",
+      "42",
+      "--temp",
+      "0",
+      "--ctx-size",
+      "4096",
+      "--batch-size",
+      "512",
+      "--ubatch-size",
+      "512",
+      "--threads",
+      "8",
+      "--no-repack",
+      "--no-warmup",
+      "--no-display-prompt"
+    ],
+    "environment": {
+      "PDCAT_MODEL_ID": "qwen1.5-moe-a2.7b-q8",
+      "PDCAT_MODEL_SHA256": "4e676979a67033ccdfc0daacf893705e5b3063973b42056e48f287f04d80cb4a",
+      "PDCAT_MODEL_EXPERT_COUNT": "60",
+      "PDCAT_IO_MAX_QD": "6",
+      "PDCAT_IO_MAX_P1_QD": "4",
+      "PDCAT_IO_MAX_INFLIGHT_BYTES": "67108864",
+      "PDCAT_IO_P0_RESERVED_BYTES": "20971520",
+      "PDCAT_IO_MAX_P1_INFLIGHT_BYTES": "41943040",
+      "PDCAT_IO_MAX_SPECULATIVE_BYTES": "18874368",
+      "PDCAT_IO_MAX_BACKGROUND_BYTES": "16777216"
+    }
+  },
+  "workload": {
+    "prompt": "hello, please introduce yourself",
+    "n_predict": 8
+  },
+  "trace": {
+    "moe_gate": true,
+    "expert_io": true
+  },
+  "output_root": "experiments/pdcat/runs",
+  "default_profile": "cache_cpu",
+  "profiles": {
+    "native_cpu": {
+      "description": "Qwen CPU oracle with normal mmap and no ExpertManager.",
+      "args": [
+        "--gpu-layers",
+        "0",
+        "--mmap",
+        "--no-direct-io",
+        "--expert-cache-capacity",
+        "0"
+      ],
+      "environment": {}
+    },
+    "cache_cpu": {
+      "description": "Qwen CPU execution through the model-generic demand-loaded ExpertManager.",
+      "args": [
+        "--gpu-layers",
+        "0",
+        "--cpu-moe",
+        "--no-mmap",
+        "--no-direct-io",
+        "--expert-cache-capacity",
+        "60"
+      ],
+      "environment": {}
+    },
+    "native_mixed": {
+      "description": "Qwen GPU non-expert path with native CPU MoE weights.",
+      "args": [
+        "--gpu-layers",
+        "all",
+        "--cpu-moe",
+        "--mmap",
+        "--no-direct-io",
+        "--expert-cache-capacity",
+        "0"
+      ],
+      "environment": {}
+    },
+    "cache_mixed": {
+      "description": "Qwen GPU path consuming mapped ExpertManager slots without a model-specific sidecar.",
+      "args": [
+        "--gpu-layers",
+        "all",
+        "--fit",
+        "off",
+        "--no-mmap",
+        "--no-direct-io",
+        "--expert-cache-capacity",
+        "60"
+      ],
+      "environment": {
+        "LLAMA_MOE_CUDA_DELIVERY": "mapped"
+      }
+    }
+  }
+}

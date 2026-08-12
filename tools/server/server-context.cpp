@@ -746,6 +746,10 @@ private:
         bool is_resume = sleeping;
 
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
+        if (params.pdcat_kv_p4 && params.expert_cache_capacity == 0) {
+            SRV_ERR("%s", "--pdcat-kv-p4 requires --expert-cache-capacity > 0\n");
+            return false;
+        }
 
         params_base = params;
 
@@ -1985,7 +1989,19 @@ private:
                     std::string filepath = task.slot_action.filepath;
 
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
-                    const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, tokens.data(), token_count);
+                    const size_t nwrite = params_base.pdcat_kv_p4
+                            ? llama_state_seq_save_file_p4(
+                                    ctx, filepath.c_str(), slot->id, tokens.data(), token_count)
+                            : llama_state_seq_save_file(
+                                    ctx, filepath.c_str(), slot->id, tokens.data(), token_count);
+                    if (nwrite == 0) {
+                        send_error(
+                                task,
+                                params_base.pdcat_kv_p4
+                                        ? "Failed to save slot state through P4 scheduler"
+                                        : "Failed to save slot state");
+                        break;
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;

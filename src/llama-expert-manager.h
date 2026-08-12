@@ -56,6 +56,13 @@ struct ExpertSlice {
     uint64_t file_size = 0;
 };
 
+struct ExpertPrediction {
+    int32_t layer = -1;
+    int32_t expert = -1;
+    float probability = 0.0f;
+    uint64_t deadline_ns = 0;
+};
+
 inline ExpertSlice make_expert_slice(
         MoePart part,
         int32_t file_id,
@@ -80,6 +87,13 @@ struct llama_expert_slice_ffi {
     int32_t file_id;
     uint64_t file_offset;
     uint64_t file_size;
+};
+
+struct llama_expert_prediction_ffi {
+    int32_t layer;
+    int32_t expert;
+    float probability;
+    uint64_t deadline_ns;
 };
 
 // Implemented by the Rust expert cache crate. ensure() pins the expert until
@@ -113,11 +127,35 @@ int32_t llama_expert_manager_ensure_many(
         size_t count,
         llama_expert_handle_ffi ** handles_out);
 
-llama_expert_ticket_ffi * llama_expert_manager_submit_batch_async(
+int32_t llama_expert_manager_prefetch_many(
         llama_expert_manager_ffi * manager,
         int32_t layer,
         const int32_t * experts,
         size_t count);
+
+int32_t llama_expert_manager_prefetch_next_layer_mandatory(
+        llama_expert_manager_ffi * manager,
+        int32_t current_layer,
+        int32_t * target_layer_out);
+
+int32_t llama_expert_manager_predict_prefetch_next(
+        llama_expert_manager_ffi * manager,
+        int32_t layer,
+        const int32_t * experts,
+        size_t count,
+        const float * router_scores,
+        size_t max_predictions,
+        uint64_t current_token_id,
+        uint64_t deadline_ns,
+        llama_expert_prediction_ffi * predictions_out,
+        size_t predictions_capacity);
+
+llama_expert_ticket_ffi * llama_expert_manager_submit_batch_async(
+        llama_expert_manager_ffi * manager,
+        int32_t layer,
+        const int32_t * experts,
+        size_t count,
+        uint64_t token_id);
 
 llama_expert_handle_ffi * llama_expert_ticket_get_handle(
         const llama_expert_ticket_ffi * ticket,
@@ -179,6 +217,14 @@ int32_t llama_expert_manager_register_file(
         int32_t file_id,
         const char * path);
 
+
+int32_t llama_expert_manager_write_background_file(
+        llama_expert_manager_ffi * manager,
+        const char * path,
+        const uint8_t * data,
+        size_t data_size,
+        int32_t kv_slot_id,
+        size_t * written_out);
 const char * llama_expert_manager_last_error_message();
 
 int32_t llama_expert_manager_stats(
@@ -338,7 +384,7 @@ public:
             }
             throw std::runtime_error("failed to create MoE expert manager: Rust FFI is not linked or returned null without an error");
         }
-        return ExpertManager(impl, true);
+        return ExpertManager(impl, true, TensorLayout{}, capacity);
     }
 
     static ExpertManager create_with_slot_size(
@@ -370,14 +416,15 @@ public:
             }
             throw std::runtime_error("failed to create MoE expert manager: Rust FFI is not linked or returned null without an error");
         }
-        return ExpertManager(impl, true, layout);
+        return ExpertManager(impl, true, layout, capacity);
     }
 
     explicit ExpertManager(
             llama_expert_manager_ffi * impl,
             bool owns_impl = false,
-            TensorLayout layout = TensorLayout{})
-        : impl_(impl), owns_impl_(owns_impl), layout_(std::move(layout)) {
+            TensorLayout layout = TensorLayout{},
+            size_t capacity = 0)
+        : impl_(impl), owns_impl_(owns_impl), layout_(std::move(layout)), capacity_(capacity) {
         if (impl_ == nullptr) {
             throw std::invalid_argument("ExpertManager requires a non-null Rust manager");
         }
@@ -390,8 +437,10 @@ public:
         impl_ = other.impl_;
         owns_impl_ = other.owns_impl_;
         layout_ = std::move(other.layout_);
+        capacity_ = other.capacity_;
         other.impl_ = nullptr;
         other.owns_impl_ = false;
+        other.capacity_ = 0;
     }
 
     ExpertManager & operator=(ExpertManager && other) noexcept {
@@ -400,8 +449,10 @@ public:
             impl_ = other.impl_;
             owns_impl_ = other.owns_impl_;
             layout_ = std::move(other.layout_);
+            capacity_ = other.capacity_;
             other.impl_ = nullptr;
             other.owns_impl_ = false;
+            other.capacity_ = 0;
         }
         return *this;
     }
@@ -416,6 +467,10 @@ public:
 
     const TensorLayout & layout() const {
         return layout_;
+    }
+
+    size_t capacity() const {
+        return capacity_;
     }
 
     const TensorLayoutEntry * layout_entry(MoePart part) const {
@@ -515,7 +570,129 @@ public:
         return handles;
     }
 
-    ExpertTicket submit_batch_async(std::vector<ExpertKey> experts) {
+    void prefetch_many(std::vector<ExpertKey> experts) {
+        std::sort(experts.begin(), experts.end());
+        experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
+        if (experts.empty()) {
+            return;
+        }
+
+        const int32_t layer = experts.front().layer;
+        std::vector<int32_t> expert_ids;
+        expert_ids.reserve(experts.size());
+        for (const ExpertKey & key : experts) {
+            if (key.layer != layer) {
+                throw std::runtime_error("failed to prefetch MoE experts from multiple layers");
+            }
+            expert_ids.push_back(key.expert);
+        }
+
+        const int32_t rc = llama_expert_manager_prefetch_many(
+                impl_,
+                layer,
+                expert_ids.data(),
+                expert_ids.size());
+        if (rc != 0) {
+            const char * err = llama_expert_manager_last_error_message();
+            if (err != nullptr && err[0] != '\0') {
+                throw std::runtime_error(std::string("failed to prefetch MoE experts: ") + err);
+            }
+            throw std::runtime_error("failed to prefetch MoE experts");
+        }
+    }
+
+    std::pair<int32_t, size_t> prefetch_next_layer_mandatory(int32_t current_layer) {
+        int32_t target_layer = -1;
+        const int32_t count = llama_expert_manager_prefetch_next_layer_mandatory(
+                impl_, current_layer, &target_layer);
+        if (count < 0) {
+            const char * err = llama_expert_manager_last_error_message();
+            if (err != nullptr && err[0] != '\0') {
+                throw std::runtime_error(
+                        std::string("failed to prefetch mandatory next MoE layer: ") + err);
+            }
+            throw std::runtime_error("failed to prefetch mandatory next MoE layer");
+        }
+        if (count == 0) {
+            return {-1, 0};
+        }
+        return {target_layer, static_cast<size_t>(count)};
+    }
+
+    std::vector<ExpertPrediction> predict_prefetch_next(
+            int32_t layer,
+            std::vector<int32_t> experts,
+            std::vector<float> router_scores,
+            size_t max_predictions,
+            uint64_t current_token_id,
+            uint64_t deadline_ns) {
+        if (!router_scores.empty() && router_scores.size() != experts.size()) {
+            throw std::invalid_argument("router score count must match expert count");
+        }
+        if (router_scores.empty()) {
+            std::sort(experts.begin(), experts.end());
+            experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
+        } else {
+            std::vector<std::pair<int32_t, float>> routes;
+            routes.reserve(experts.size());
+            for (size_t i = 0; i < experts.size(); ++i) {
+                routes.emplace_back(experts[i], router_scores[i]);
+            }
+            std::sort(routes.begin(), routes.end(),
+                    [](const auto & left, const auto & right) {
+                        return left.first < right.first;
+                    });
+            experts.clear();
+            router_scores.clear();
+            for (const auto & route : routes) {
+                if (!experts.empty() && experts.back() == route.first) {
+                    router_scores.back() = std::max(router_scores.back(), route.second);
+                } else {
+                    experts.push_back(route.first);
+                    router_scores.push_back(route.second);
+                }
+            }
+        }
+        if (experts.empty() || max_predictions == 0) {
+            return {};
+        }
+
+        std::vector<llama_expert_prediction_ffi> raw(max_predictions);
+        const int32_t count = llama_expert_manager_predict_prefetch_next(
+                impl_,
+                layer,
+                experts.data(),
+                experts.size(),
+                router_scores.empty() ? nullptr : router_scores.data(),
+                max_predictions,
+                current_token_id,
+                deadline_ns,
+                raw.data(),
+                raw.size());
+        if (count < 0) {
+            const char * err = llama_expert_manager_last_error_message();
+            if (err != nullptr && err[0] != '\0') {
+                throw std::runtime_error(std::string("failed to predict/prefetch MoE experts: ") + err);
+            }
+            throw std::runtime_error("failed to predict/prefetch MoE experts");
+        }
+
+        std::vector<ExpertPrediction> predictions;
+        predictions.reserve(static_cast<size_t>(count));
+        for (int32_t i = 0; i < count; ++i) {
+            predictions.push_back({
+                raw[static_cast<size_t>(i)].layer,
+                raw[static_cast<size_t>(i)].expert,
+                raw[static_cast<size_t>(i)].probability,
+                raw[static_cast<size_t>(i)].deadline_ns,
+            });
+        }
+        return predictions;
+    }
+
+    ExpertTicket submit_batch_async(
+            std::vector<ExpertKey> experts,
+            uint64_t token_id = UINT64_MAX) {
         std::sort(experts.begin(), experts.end());
         experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
 
@@ -537,7 +714,8 @@ public:
                 impl_,
                 layer,
                 expert_ids.data(),
-                expert_ids.size());
+                expert_ids.size(),
+                token_id);
         if (ticket == nullptr) {
             const char * err = llama_expert_manager_last_error_message();
             if (err != nullptr && err[0] != '\0') {
@@ -562,6 +740,32 @@ public:
         if (rc != 0) {
             throw std::runtime_error("failed to register MoE expert file");
         }
+    }
+
+    size_t write_background_file(
+            const std::string & path,
+            const std::vector<uint8_t> & data,
+            int32_t kv_slot_id) {
+        size_t written = 0;
+        const int32_t rc = llama_expert_manager_write_background_file(
+                impl_,
+                path.c_str(),
+                data.data(),
+                data.size(),
+                kv_slot_id,
+                &written);
+        if (rc != 0) {
+            const char * err = llama_expert_manager_last_error_message();
+            if (err != nullptr && err[0] != '\0') {
+                throw std::runtime_error(
+                        std::string("failed to write KV state through P4 scheduler: ") + err);
+            }
+            throw std::runtime_error("failed to write KV state through P4 scheduler");
+        }
+        if (written != data.size()) {
+            throw std::runtime_error("P4 scheduler returned a short KV state write");
+        }
+        return written;
     }
 
     void release(llama_expert_handle_ffi * handle) {
@@ -638,11 +842,13 @@ private:
         }
         impl_ = nullptr;
         owns_impl_ = false;
+        capacity_ = 0;
     }
 
     llama_expert_manager_ffi * impl_ = nullptr;
     bool owns_impl_ = false;
     TensorLayout layout_;
+    size_t capacity_ = 0;
 
     friend class ExpertTicket;
     friend class ExpertHandle;

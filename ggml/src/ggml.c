@@ -75,11 +75,14 @@ void ggml_moe_expert_set_callback(
     g_moe_expert_cb_data = data;
 }
 
-void * ggml_moe_expert_ensure(const struct ggml_tensor * src0, const struct ggml_tensor * ids) {
+void * ggml_moe_expert_ensure(
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * ids,
+        const struct ggml_tensor * router_scores) {
     if (g_moe_expert_ensure_cb == NULL) {
         return NULL;
     }
-    return g_moe_expert_ensure_cb(g_moe_expert_cb_data, src0, ids);
+    return g_moe_expert_ensure_cb(g_moe_expert_cb_data, src0, ids, router_scores);
 }
 
 const void * ggml_moe_expert_get_data(void * handle, int32_t expert, const void * fallback) {
@@ -3334,6 +3337,15 @@ struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_tensor  * as,
         struct ggml_tensor  * b,
         struct ggml_tensor  * ids) {
+    return ggml_mul_mat_id_with_router_scores(ctx, as, b, ids, NULL);
+}
+
+struct ggml_tensor * ggml_mul_mat_id_with_router_scores(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * router_scores) {
     GGML_ASSERT(!ggml_is_transposed(as));
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
 
@@ -3344,6 +3356,14 @@ struct ggml_tensor * ggml_mul_mat_id(
     GGML_ASSERT(as->ne[0] == b->ne[0]); // can_mul_mat
     GGML_ASSERT(ids->ne[0] % b->ne[1] == 0); // can broadcast
 
+    if (router_scores != NULL) {
+        GGML_ASSERT(router_scores->type == GGML_TYPE_F32);
+        GGML_ASSERT(router_scores->ne[0] == 1);
+        GGML_ASSERT(router_scores->ne[1] == ids->ne[0]);
+        GGML_ASSERT(router_scores->ne[2] == ids->ne[1]);
+        GGML_ASSERT(router_scores->ne[3] == 1);
+    }
+
     const int64_t ne[4] = { as->ne[1], ids->ne[0], b->ne[2], 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
@@ -3351,6 +3371,7 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+    result->src[3] = router_scores;
 
     return result;
 }

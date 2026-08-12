@@ -127,24 +127,24 @@ def repository_snapshot(repo: Path) -> dict[str, Any]:
     }
 
 
-def nvme_snapshot() -> list[dict[str, Any]]:
+def nvme_snapshot(include_sensitive_identifiers: bool) -> list[dict[str, Any]]:
     controllers: list[dict[str, Any]] = []
     for controller in sorted(Path("/sys/class/nvme").glob("nvme*")):
         if not controller.name[4:].isdigit():
             continue
         device = controller / "device"
-        controllers.append(
-            {
-                "name": controller.name,
-                "model": read_text(controller / "model"),
-                "serial": read_text(controller / "serial"),
-                "firmware_revision": read_text(controller / "firmware_rev"),
-                "current_link_speed": read_text(device / "current_link_speed"),
-                "current_link_width": read_text(device / "current_link_width"),
-                "max_link_speed": read_text(device / "max_link_speed"),
-                "max_link_width": read_text(device / "max_link_width"),
-            }
-        )
+        snapshot = {
+            "name": controller.name,
+            "model": read_text(controller / "model"),
+            "firmware_revision": read_text(controller / "firmware_rev"),
+            "current_link_speed": read_text(device / "current_link_speed"),
+            "current_link_width": read_text(device / "current_link_width"),
+            "max_link_speed": read_text(device / "max_link_speed"),
+            "max_link_width": read_text(device / "max_link_width"),
+        }
+        if include_sensitive_identifiers:
+            snapshot["serial"] = read_text(controller / "serial")
+        controllers.append(snapshot)
     return controllers
 
 
@@ -190,8 +190,15 @@ def model_snapshot(path: Path, hash_files: bool) -> dict[str, Any]:
     }
 
 
-def collect(models: list[Path], hash_models: bool) -> dict[str, Any]:
+def collect(
+    models: list[Path],
+    hash_models: bool,
+    include_sensitive_identifiers: bool,
+) -> dict[str, Any]:
     nvcc = Path("/usr/local/cuda/bin/nvcc")
+    block_columns = "NAME,MODEL,FSTYPE,SIZE,FSAVAIL,FSUSE%"
+    if include_sensitive_identifiers:
+        block_columns = "NAME,MODEL,SERIAL,FSTYPE,SIZE,FSAVAIL,FSUSE%"
     notes = [
         "Power/clock commands are unavailable in this container; record nvpmodel and jetson_clocks on the host before final runs.",
         "Record GGUF architecture, quantization, layers, experts, top-k, and expert byte layout in the run configuration.",
@@ -227,9 +234,9 @@ def collect(models: list[Path], hash_models: bool) -> dict[str, Any]:
             "workspace_mount": run_json(["findmnt", "-J", "-T", str(WORKSPACE)]),
             "data_mount": run_json(["findmnt", "-J", "-T", "/data"]),
             "block_devices": run_json(
-                ["lsblk", "-J", "-b", "-o", "NAME,MODEL,SERIAL,FSTYPE,SIZE,FSAVAIL,FSUSE%"]
+                ["lsblk", "-J", "-b", "-o", block_columns]
             ),
-            "nvme_controllers": nvme_snapshot(),
+            "nvme_controllers": nvme_snapshot(include_sensitive_identifiers),
         },
         "repositories": [repository_snapshot(repo) for repo in DEFAULT_REPOSITORIES],
         "models": [model_snapshot(model, hash_models) for model in models],
@@ -299,9 +306,16 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=Path("experiments/pdcat"))
     parser.add_argument("--model", action="append", type=Path, default=[])
     parser.add_argument("--hash-models", action="store_true")
+    parser.add_argument(
+        "--include-sensitive-identifiers",
+        action="store_true",
+        help="Include storage serial numbers. Disabled by default for committable snapshots.",
+    )
     args = parser.parse_args()
 
-    snapshot = collect(args.model, args.hash_models)
+    snapshot = collect(
+        args.model, args.hash_models, args.include_sensitive_identifiers
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "environment.json").write_text(
         json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n",

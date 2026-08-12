@@ -1,0 +1,224 @@
+{
+  "schema_version": 1,
+  "experiment_id": "deepseek-v2-lite-q8_0",
+  "primary_model": true,
+  "model": {
+    "path": "/data/models/DeepSeek-V2-Lite-GGUF/DeepSeek-V2-Lite-Q8_0.gguf",
+    "sha256": "7b131e7fdddd10eeca4d1716832de9aaa60ff2544a94bec13cb34946bec514b0",
+    "size_bytes": 16702520096,
+    "gguf_architecture": "deepseek2",
+    "quantization": "Q8_0",
+    "expected_topology": {
+      "block_count": 27,
+      "leading_dense_block_count": 1,
+      "expert_count": 64,
+      "expert_used_count": 6,
+      "moe_layer_count": 26,
+      "parts": [
+        "down",
+        "gate",
+        "up"
+      ],
+      "expert_object_bytes": 9191424,
+      "expert_tensor_count": 78,
+      "expert_object_count": 1664
+    },
+    "tensor_adapter": {
+      "name": "gguf-ffn-exps-v1",
+      "tensor_pattern": "^blk\\.(?P<layer>\\d+)\\.ffn_(?P<part>gate_up|gate|down|up)_exps(?:\\.weight)?$",
+      "expert_axis": 2,
+      "part_order": [
+        "up",
+        "gate",
+        "down",
+        "gate_up"
+      ]
+    },
+    "expert_pack": {
+      "manifest": "/data/models/DeepSeek-V2-Lite-GGUF/DeepSeek-V2-Lite-Q8_0.pdcat-experts.pack.json",
+      "manifest_sha256": "a7e316533ec17380ff78afffcbe496643bb93064f6145e12e57493634b3fe87c",
+      "path": "/data/models/DeepSeek-V2-Lite-GGUF/DeepSeek-V2-Lite-Q8_0.pdcat-experts.pack",
+      "sha256": "9a24592f0151c87d9107e996a8896359d6a6639f6fdb22ea283dab3e0ded6231",
+      "size_bytes": 15294529536,
+      "alignment": 4096,
+      "object_count": 1664
+    }
+  },
+  "command": {
+    "binary": "build-expert-cache/bin/llama-completion",
+    "base_args": [
+      "--seed",
+      "42",
+      "--temp",
+      "0",
+      "--ctx-size",
+      "4096",
+      "--batch-size",
+      "512",
+      "--ubatch-size",
+      "512",
+      "--threads",
+      "8",
+      "--no-repack",
+      "--no-warmup",
+      "--no-display-prompt"
+    ],
+    "environment": {
+      "PDCAT_MODEL_ID": "deepseek-v2-lite-q8_0",
+      "PDCAT_MODEL_SHA256": "7b131e7fdddd10eeca4d1716832de9aaa60ff2544a94bec13cb34946bec514b0",
+      "PDCAT_MODEL_EXPERT_COUNT": "64",
+      "PDCAT_IO_MAX_QD": "6",
+      "PDCAT_IO_MAX_P1_QD": "4",
+      "PDCAT_IO_MAX_INFLIGHT_BYTES": "67108864",
+      "PDCAT_IO_P0_RESERVED_BYTES": "20971520",
+      "PDCAT_IO_MAX_P1_INFLIGHT_BYTES": "41943040",
+      "PDCAT_IO_MAX_SPECULATIVE_BYTES": "18874368",
+      "PDCAT_IO_MAX_BACKGROUND_BYTES": "16777216"
+    }
+  },
+  "workload": {
+    "prompt": "hello, please introduce yourself",
+    "n_predict": 80
+  },
+  "trace": {
+    "moe_gate": true,
+    "expert_io": true
+  },
+  "output_root": "experiments/pdcat/runs",
+  "default_profile": "cache_mixed",
+  "profiles": {
+    "native_cpu": {
+      "description": "Unmodified CPU oracle with normal mmap and no ExpertManager.",
+      "args": [
+        "--gpu-layers",
+        "0",
+        "--mmap",
+        "--no-direct-io",
+        "--expert-cache-capacity",
+        "0"
+      ],
+      "environment": {}
+    },
+    "cache_cpu": {
+      "description": "CPU execution using the demand-loaded ExpertManager.",
+      "use_expert_pack": true,
+      "args": [
+        "--gpu-layers",
+        "0",
+        "--cpu-moe",
+        "--no-mmap",
+        "--direct-io",
+        "--expert-cache-capacity",
+        "64"
+      ],
+      "environment": {}
+    },
+    "native_mixed": {
+      "description": "GPU non-expert path with native CPU MoE weights.",
+      "args": [
+        "--gpu-layers",
+        "all",
+        "--cpu-moe",
+        "--mmap",
+        "--no-direct-io",
+        "--expert-cache-capacity",
+        "0"
+      ],
+      "environment": {}
+    },
+    "cache_mixed": {
+      "description": "GPU path consuming mapped ExpertManager slots.",
+      "use_expert_pack": true,
+      "args": [
+        "--gpu-layers",
+        "all",
+        "--fit",
+        "off",
+        "--no-mmap",
+        "--direct-io",
+        "--expert-cache-capacity",
+        "64"
+      ],
+      "environment": {
+        "LLAMA_MOE_CUDA_DELIVERY": "mapped"
+      }
+    },
+    "cache_mixed_prefill_stream": {
+      "description": "Topology-driven P1 full-next-layer prefill staging with a two-layer Expert cache.",
+      "use_expert_pack": true,
+      "args": [
+        "--gpu-layers",
+        "all",
+        "--fit",
+        "off",
+        "--no-mmap",
+        "--direct-io",
+        "--expert-cache-capacity",
+        "128"
+      ],
+      "environment": {
+        "LLAMA_MOE_CUDA_DELIVERY": "mapped",
+        "LLAMA_MOE_PREFILL_STREAMING": "1"
+      }
+    },
+    "cache_mixed_predict_history": {
+      "description": "Mapped CUDA path with always-on model-generic history prediction and P2 prefetch.",
+      "use_expert_pack": true,
+      "args": [
+        "--gpu-layers",
+        "all",
+        "--fit",
+        "off",
+        "--no-mmap",
+        "--direct-io",
+        "--expert-cache-capacity",
+        "64"
+      ],
+      "environment": {
+        "LLAMA_MOE_CUDA_DELIVERY": "mapped",
+        "LLAMA_MOE_PREDICTOR": "history",
+        "LLAMA_MOE_PREDICTOR_TOP_N": "2",
+        "LLAMA_MOE_PREDICTOR_DEADLINE_US": "40000"
+      }
+    },
+    "cache_mixed_predict_mlp": {
+      "description": "Mapped CUDA path with the validation-selected prompt-isolated hidden-128 safetensors MLP predictor.",
+      "use_expert_pack": true,
+      "args": [
+        "--gpu-layers",
+        "all",
+        "--fit",
+        "off",
+        "--no-mmap",
+        "--direct-io",
+        "--expert-cache-capacity",
+        "64"
+      ],
+      "environment": {
+        "LLAMA_MOE_CUDA_DELIVERY": "mapped",
+        "LLAMA_MOE_PREDICTOR": "mlp",
+        "LLAMA_MOE_PREDICTOR_TOP_N": "2",
+        "LLAMA_MOE_PREDICTOR_DEADLINE_US": "40000",
+        "PDCAT_PREDICTOR_TOP_K": "2",
+        "PDCAT_PREDICTOR_MANIFEST": "${REPO_ROOT}/experiments/pdcat/predictor/deepseek-v2-lite/manifest.json"
+      }
+    },
+    "cache_mixed_promote": {
+      "description": "Same CUDA kernel after copying active Expert slots to device memory.",
+      "use_expert_pack": true,
+      "args": [
+        "--gpu-layers",
+        "all",
+        "--fit",
+        "off",
+        "--no-mmap",
+        "--direct-io",
+        "--expert-cache-capacity",
+        "64"
+      ],
+      "environment": {
+        "LLAMA_MOE_CUDA_DELIVERY": "promote"
+      }
+    }
+  }
+}

@@ -1,6 +1,7 @@
 #include "llama-model.h"
 
 #include "llama-arch.h"
+#include "llama-expert-pack.h"
 #include "llama-expert-manager.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
@@ -27,6 +28,9 @@
 #include <cfloat>
 #include <cstdlib>
 #include <cstdint>
+#include <cstdio>
+#include <cinttypes>
+#include <filesystem>
 #include <cstring>
 #include <cmath>
 #include <fstream>
@@ -37,6 +41,7 @@
 #include <numeric>
 #include <regex>
 #include <sstream>
+#include <unordered_set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -88,8 +93,38 @@ __attribute__((weak)) llama_expert_ticket_ffi * llama_expert_manager_submit_batc
         llama_expert_manager_ffi *,
         int32_t,
         const int32_t *,
-        size_t) {
+        size_t,
+        uint64_t) {
     return nullptr;
+}
+
+__attribute__((weak)) int32_t llama_expert_manager_prefetch_many(
+        llama_expert_manager_ffi *,
+        int32_t,
+        const int32_t *,
+        size_t) {
+    return -1;
+}
+
+__attribute__((weak)) int32_t llama_expert_manager_prefetch_next_layer_mandatory(
+        llama_expert_manager_ffi *,
+        int32_t,
+        int32_t *) {
+    return -1;
+}
+
+__attribute__((weak)) int32_t llama_expert_manager_predict_prefetch_next(
+        llama_expert_manager_ffi *,
+        int32_t,
+        const int32_t *,
+        size_t,
+        const float *,
+        size_t,
+        uint64_t,
+        uint64_t,
+        llama_expert_prediction_ffi *,
+        size_t) {
+    return -1;
 }
 
 __attribute__((weak)) llama_expert_handle_ffi * llama_expert_ticket_get_handle(
@@ -179,6 +214,16 @@ __attribute__((weak)) int32_t llama_expert_manager_register_file(
     return -1;
 }
 
+__attribute__((weak)) int32_t llama_expert_manager_write_background_file(
+        llama_expert_manager_ffi *,
+        const char *,
+        const uint8_t *,
+        size_t,
+        int32_t,
+        size_t *) {
+    return -1;
+}
+
 __attribute__((weak)) void llama_expert_manager_free(llama_expert_manager_ffi *) {
 }
 
@@ -201,13 +246,19 @@ namespace {
 struct llama_moe_gate_trace_event {
     uint64_t sequence = 0;
     uint64_t timestamp_ns = 0;
+    int64_t token_id = -1;
+    int64_t token_count = 0;
     int32_t layer = -1;
     int32_t expert = -1;
     int32_t part = -1;
     int32_t slot = -1;
     uint64_t generation = 0;
     std::string kind;
+    std::string run_id;
+    std::string request_id;
+    std::string phase;
     std::vector<int32_t> experts;
+    std::vector<float> router_scores;
 };
 
 class llama_moe_gate_trace {
@@ -217,6 +268,10 @@ public:
         if (path != nullptr && path[0] != '\0') {
             path_ = path;
         }
+    }
+
+    bool enabled() const {
+        return !path_.empty();
     }
 
     ~llama_moe_gate_trace() {
@@ -235,6 +290,16 @@ public:
             output << "{\"event\":\"" << event.kind
                    << "\",\"sequence\":" << event.sequence
                    << ",\"timestamp_ns\":" << event.timestamp_ns
+                   << ",\"run_id\":\"" << event.run_id
+                   << "\",\"request_id\":\"" << event.request_id
+                   << "\",\"phase\":\"" << event.phase
+                   << "\",\"token_id\":";
+            if (event.token_id >= 0) {
+                output << event.token_id;
+            } else {
+                output << "null";
+            }
+            output << ",\"token_count\":" << event.token_count
                    << ",\"layer_id\":" << event.layer;
             if (event.expert >= 0) {
                 output << ",\"logical_expert_id\":" << event.expert
@@ -252,21 +317,46 @@ public:
                 }
                 output << ']';
             }
+            if (!event.router_scores.empty()) {
+                output << ",\"router_scores\":[";
+                for (size_t i = 0; i < event.router_scores.size(); ++i) {
+                    if (i > 0) {
+                        output << ',';
+                    }
+                    output << event.router_scores[i];
+                }
+                output << ']';
+            }
             output << "}\n";
         }
     }
 
-    void record_route(int32_t layer, const std::vector<int32_t> & experts) {
+    void record_route(
+            int32_t layer,
+            int64_t token_count,
+            const std::vector<int32_t> & experts,
+            const std::vector<float> & router_scores) {
         if (path_.empty()) {
             return;
         }
         llama_moe_gate_trace_event event;
-        event.sequence = sequence_.fetch_add(1, std::memory_order_relaxed);
+        capture_context(event, token_count);
         event.timestamp_ns = now_ns();
         event.layer = layer;
         event.kind = "router_selection";
+        event.router_scores = router_scores;
         event.experts = experts;
+
+        const std::string route_key =
+                event.request_id + "|" + event.phase + "|" +
+                std::to_string(event.token_id) + "|" + std::to_string(layer);
         std::lock_guard<std::mutex> lock(mutex_);
+        auto previous = last_route_by_context_.find(route_key);
+        if (previous != last_route_by_context_.end() && previous->second == experts) {
+            return;
+        }
+        last_route_by_context_[route_key] = experts;
+        event.sequence = sequence_.fetch_add(1, std::memory_order_relaxed);
         events_.push_back(std::move(event));
     }
 
@@ -275,6 +365,7 @@ public:
             return;
         }
         llama_moe_gate_trace_event event;
+        capture_context(event, 0);
         event.sequence = sequence_.fetch_add(1, std::memory_order_relaxed);
         event.timestamp_ns = now_ns();
         event.layer = layer;
@@ -288,6 +379,27 @@ public:
     }
 
 private:
+    static std::string environment_value(const char * name, const char * fallback) {
+        const char * value = std::getenv(name);
+        return value != nullptr && value[0] != '\0' ? value : fallback;
+    }
+
+    static void capture_context(llama_moe_gate_trace_event & event, int64_t token_count) {
+        event.run_id = environment_value("PDCAT_RUN_ID", "unassigned");
+        event.request_id = environment_value("PDCAT_REQUEST_ID", "request-0");
+        event.token_count = token_count;
+        event.phase = environment_value(
+                "PDCAT_PHASE", token_count > 1 ? "prefill" : "decode");
+        const char * raw_token_id = std::getenv("PDCAT_TOKEN_ID");
+        if (raw_token_id != nullptr && raw_token_id[0] != '\0') {
+            char * end = nullptr;
+            const long long parsed = std::strtoll(raw_token_id, &end, 10);
+            if (end != raw_token_id && end != nullptr && end[0] == '\0' && parsed >= 0) {
+                event.token_id = parsed;
+            }
+        }
+    }
+
     static uint64_t now_ns() {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -297,6 +409,7 @@ private:
     std::atomic<uint64_t> sequence_{0};
     std::mutex mutex_;
     std::vector<llama_moe_gate_trace_event> events_;
+    std::unordered_map<std::string, std::vector<int32_t>> last_route_by_context_;
 };
 
 llama_moe_gate_trace & llama_moe_gate_trace_instance() {
@@ -530,15 +643,268 @@ bool llama_linux_is_jetson() {
     return release.good();
 }
 
-void * llama_moe_expert_ensure_callback(void *, const ggml_tensor * src0, const ggml_tensor * ids) {
+bool llama_moe_predictor_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("LLAMA_MOE_PREDICTOR");
+        return value != nullptr
+            && value[0] != '\0'
+            && std::strcmp(value, "0") != 0
+            && std::strcmp(value, "off") != 0;
+    }();
+    return enabled;
+}
+
+bool llama_moe_prefill_streaming_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("LLAMA_MOE_PREFILL_STREAMING");
+        return value != nullptr
+            && value[0] != '\0'
+            && std::strcmp(value, "0") != 0
+            && std::strcmp(value, "off") != 0;
+    }();
+    return enabled;
+}
+
+void llama_moe_prefill_stream_next(ExpertManager * manager, int32_t current_layer) {
+    if (!llama_moe_prefill_streaming_enabled() || manager == nullptr) {
+        return;
+    }
+    try {
+        const auto [target_layer, expert_count] =
+                manager->prefetch_next_layer_mandatory(current_layer);
+        if (expert_count == 0) {
+            return;
+        }
+        std::fprintf(stderr,
+                "[PDCAT][prefill-p1-submit] source_layer=%d target_layer=%d"
+                " experts=%zu cache_capacity=%zu policy=full-layer-double-buffer\n",
+                current_layer,
+                target_layer,
+                expert_count,
+                manager->capacity());
+    } catch (const std::exception & error) {
+        LLAMA_LOG_WARN(
+                "[PDCAT][prefill-p1-fallback] source_layer=%d error=%s;"
+                " native P0 demand path remains active\n",
+                current_layer,
+                error.what());
+    }
+}
+
+uint64_t llama_moe_now_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+class llama_moe_online_predictor {
+public:
+    uint64_t begin_decode_layer(
+            ExpertManager * manager,
+            int32_t layer,
+            const std::vector<int32_t> & actual_experts) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto & state = states_[manager];
+        if (state.last_layer >= layer) {
+            ++state.generation;
+            for (auto it = state.pending.begin(); it != state.pending.end();) {
+                if (it->first == layer) {
+                    ++it;
+                } else {
+                    it = state.pending.erase(it);
+                }
+            }
+        }
+        const uint64_t generation = state.generation;
+        auto pending = state.pending.find(layer);
+        if (pending != state.pending.end()) {
+            size_t hits = 0;
+            for (const ExpertPrediction & prediction : pending->second) {
+                if (std::binary_search(
+                            actual_experts.begin(),
+                            actual_experts.end(),
+                            prediction.expert)) {
+                    ++hits;
+                }
+            }
+            state.predicted += pending->second.size();
+            state.actual += actual_experts.size();
+            state.hits += hits;
+            std::fprintf(stderr,
+                    "[PDCAT][predictor-result] generation=%" PRIu64
+                    " layer=%d predicted=%zu actual=%zu hits=%zu"
+                    " cumulative_recall=%.6f cumulative_precision=%.6f\n",
+                    generation,
+                    layer,
+                    pending->second.size(),
+                    actual_experts.size(),
+                    hits,
+                    state.actual == 0 ? 0.0 : static_cast<double>(state.hits) / state.actual,
+                    state.predicted == 0 ? 0.0 : static_cast<double>(state.hits) / state.predicted);
+            state.pending.erase(pending);
+        }
+        state.last_layer = layer;
+        return generation;
+    }
+
+    void observe_and_prefetch(
+            ExpertManager * manager,
+            int32_t layer,
+            const std::vector<int32_t> & actual_experts,
+            const std::vector<float> & router_scores,
+            uint64_t generation) {
+        if (!llama_moe_predictor_enabled() || manager == nullptr || actual_experts.empty()) {
+            return;
+        }
+
+        const size_t top_n = std::max<size_t>(
+                1,
+                std::min<size_t>(
+                        256,
+                        llama_expert_cache_env_mib("LLAMA_MOE_PREDICTOR_TOP_N", 2)));
+        const size_t deadline_us =
+                llama_expert_cache_env_mib("LLAMA_MOE_PREDICTOR_DEADLINE_US", 2000);
+        const uint64_t deadline_ns =
+                llama_moe_now_ns() + static_cast<uint64_t>(deadline_us) * 1000;
+
+        try {
+            std::vector<ExpertPrediction> predictions =
+                    manager->predict_prefetch_next(
+                            layer,
+                            actual_experts,
+                            router_scores,
+                            top_n,
+                            generation,
+                            deadline_ns);
+            if (predictions.empty()) {
+                return;
+            }
+            const int32_t target_layer = predictions.front().layer;
+            if (target_layer < 0 || std::any_of(
+                        predictions.begin(), predictions.end(),
+                        [target_layer](const ExpertPrediction & prediction) {
+                            return prediction.layer != target_layer;
+                        })) {
+                throw std::runtime_error("predictor returned mixed or invalid target layers");
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                states_[manager].pending[target_layer] = predictions;
+            }
+
+            std::ostringstream ids;
+            for (size_t i = 0; i < predictions.size(); ++i) {
+                if (i > 0) {
+                    ids << ',';
+                }
+                ids << predictions[i].expert << ':' << predictions[i].probability;
+            }
+            std::fprintf(stderr,
+                    "[PDCAT][predictor-submit] generation=%" PRIu64
+                    " source_layer=%d target_layer=%d candidates=%zu"
+                    " deadline_ns=%" PRIu64 " experts=%s\n",
+                    generation,
+                    layer,
+                    target_layer,
+                    predictions.size(),
+                    deadline_ns,
+                    ids.str().c_str());
+        } catch (const std::exception & error) {
+            LLAMA_LOG_WARN(
+                    "[PDCAT][predictor-fallback] generation=%" PRIu64
+                    " layer=%d error=%s; native demand path remains active\n",
+                    generation,
+                    layer,
+                    error.what());
+        }
+    }
+
+private:
+    struct state {
+        int32_t last_layer = -1;
+        uint64_t generation = 0;
+        uint64_t predicted = 0;
+        uint64_t actual = 0;
+        uint64_t hits = 0;
+        std::unordered_map<int32_t, std::vector<ExpertPrediction>> pending;
+    };
+
+    std::mutex mutex_;
+    std::unordered_map<ExpertManager *, state> states_;
+};
+
+llama_moe_online_predictor & llama_moe_online_predictor_instance() {
+    static llama_moe_online_predictor predictor;
+    return predictor;
+}
+
+std::vector<float> llama_moe_selected_router_scores(
+        const ggml_tensor * ids,
+        const ggml_tensor * scores,
+        const std::vector<int32_t> & active_experts) {
+    if (ids == nullptr || scores == nullptr || ids->ne[1] != 1 || active_experts.empty()) {
+        return {};
+    }
+    if (scores->data == nullptr || scores->type != GGML_TYPE_F32
+            || scores->ne[0] != 1
+            || scores->ne[1] < ids->ne[0]
+            || scores->ne[2] < ids->ne[1]) {
+        return {};
+    }
+
+    std::unordered_map<int32_t, float> score_by_expert;
+    for (int64_t token = 0; token < ids->ne[1]; ++token) {
+        for (int64_t route = 0; route < ids->ne[0]; ++route) {
+            int32_t expert = -1;
+            std::memcpy(&expert,
+                    (const char *) ids->data + token * ids->nb[1] + route * ids->nb[0],
+                    sizeof(expert));
+            if (expert < 0) {
+                return {};
+            }
+            float score = 0.0f;
+            std::memcpy(&score,
+                    (const char *) scores->data + token * scores->nb[2] + route * scores->nb[1],
+                    sizeof(score));
+            if (!std::isfinite(score)) {
+                return {};
+            }
+            auto & current = score_by_expert[expert];
+            current = std::max(current, std::max(0.0f, score));
+        }
+    }
+
+    std::vector<float> normalized;
+    normalized.reserve(active_experts.size());
+    float total = 0.0f;
+    for (const int32_t expert : active_experts) {
+        const float score = score_by_expert[expert];
+        normalized.push_back(score);
+        total += score;
+    }
+    if (!(total > 0.0f) || !std::isfinite(total)) {
+        return {};
+    }
+    for (float & score : normalized) {
+        score /= total;
+    }
+    return normalized;
+}
+
+void * llama_moe_expert_ensure_callback(
+        void *,
+        const ggml_tensor * src0,
+        const ggml_tensor * ids,
+        const ggml_tensor * router_scores_tensor) {
     llama_moe_tensor_meta meta;
+    bool registered = false;
     {
         std::lock_guard<std::mutex> lock(llama_moe_registry_mutex());
         auto it = llama_moe_registry().find(src0);
-        if (it == llama_moe_registry().end()) {
-            return nullptr;
+        if (it != llama_moe_registry().end()) {
+            meta = it->second;
+            registered = true;
         }
-        meta = it->second;
     }
 
     std::vector<int32_t> active_experts;
@@ -554,6 +920,26 @@ void * llama_moe_expert_ensure_callback(void *, const ggml_tensor * src0, const 
 
     std::sort(active_experts.begin(), active_experts.end());
     active_experts.erase(std::unique(active_experts.begin(), active_experts.end()), active_experts.end());
+    const std::vector<float> router_scores =
+            llama_moe_selected_router_scores(ids, router_scores_tensor, active_experts);
+
+    if (!registered) {
+        auto & trace = llama_moe_gate_trace_instance();
+        if (trace.enabled()) {
+            int32_t layer = -1;
+            const char * block_name = std::strstr(src0->name, "blk.");
+            if (block_name == nullptr
+                    || std::sscanf(block_name, "blk.%d.", &layer) != 1
+                    || layer < 0) {
+                LLAMA_LOG_WARN(
+                        "%s: cannot derive native MoE layer from tensor %s\n",
+                        __func__, src0->name);
+            } else {
+                trace.record_route(layer, ids->ne[1], active_experts, router_scores);
+            }
+        }
+        return nullptr;
+    }
 
     llama_moe_expert_shared_key key;
     key.manager = meta.manager;
@@ -582,7 +968,8 @@ void * llama_moe_expert_ensure_callback(void *, const ggml_tensor * src0, const 
         }
     }
 
-    llama_moe_gate_trace_instance().record_route(meta.layer, active_experts);
+    llama_moe_gate_trace_instance().record_route(
+            meta.layer, ids->ne[1], active_experts, router_scores);
     std::vector<ExpertKey> experts;
     experts.reserve(active_experts.size());
     for (const int32_t expert : active_experts) {
@@ -590,9 +977,26 @@ void * llama_moe_expert_ensure_callback(void *, const ggml_tensor * src0, const 
     }
 
     try {
+        const uint64_t generation = ids->ne[1] == 1
+                ? llama_moe_online_predictor_instance().begin_decode_layer(
+                        meta.manager, meta.layer, active_experts)
+                : UINT64_MAX;
         auto state = std::make_shared<llama_moe_expert_shared_state>(
                 meta.layer,
-                meta.manager->submit_batch_async(std::move(experts)));
+                meta.manager->submit_batch_async(std::move(experts), generation));
+
+        // P0 demand is submitted first. During multi-token prefill, P1 may then
+        // stage the complete next registered MoE layer without model hard-codes.
+        if (ids->ne[1] > 1) {
+            llama_moe_prefill_stream_next(meta.manager, meta.layer);
+        }
+
+        // Decode prediction is always invoked when enabled; confidence only
+        // changes the candidate list, never the native router selection.
+        if (ids->ne[1] == 1) {
+            llama_moe_online_predictor_instance().observe_and_prefetch(
+                    meta.manager, meta.layer, active_experts, router_scores, generation);
+        }
 
         {
             std::lock_guard<std::mutex> lock(llama_moe_shared_cache_mutex());
@@ -1305,6 +1709,8 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         expert_manager = std::make_unique<ExpertManager>(
                 static_cast<llama_expert_manager_ffi *>(params.expert_manager),
                 params.expert_manager_owned);
+        llama_moe_expert_install_callback();
+    } else if (std::getenv("LLAMA_MOE_GATE_TRACE_JSONL") != nullptr) {
         llama_moe_expert_install_callback();
     }
 }
@@ -8578,16 +8984,27 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    auto tensor_uses_cpu_buft = [&](ggml_tensor * tensor) {
-        auto it = tensor_bufts.find(tensor);
-        if (it == tensor_bufts.end()) {
-            return false;
+    std::unordered_set<const ggml_tensor *> routed_expert_tensors;
+    for (const llama_layer & layer : layers) {
+        for (const ggml_tensor * tensor : {
+                layer.ffn_up_exps,
+                layer.ffn_gate_exps,
+                layer.ffn_down_exps,
+                layer.ffn_gate_up_exps,
+            }) {
+            if (tensor != nullptr) {
+                routed_expert_tensors.insert(tensor);
+            }
         }
-        return ggml_backend_buft_is_host(it->second);
-    };
+    }
 
+    // Expert residency and compute placement are independent decisions.  In
+    // particular, CUDA must be allowed to execute MUL_MAT_ID while the expert
+    // weights are supplied by the external cache.  Restricting this predicate
+    // to host buffer types made --cpu-moe an accidental prerequisite and left
+    // the CUDA external-weight path unreachable.
     auto is_expert_cache_moe_tensor = [&](ggml_tensor * tensor) {
-        return has_gguf_weight(tensor) && tensor_uses_cpu_buft(tensor);
+        return has_gguf_weight(tensor) && routed_expert_tensors.count(tensor) != 0;
     };
 
     auto estimate_model_allocation_bytes = [&](bool host_resident) {
@@ -8622,14 +9039,48 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         return by_device;
     };
 
+    std::unique_ptr<ExpertPackManifest> expert_pack;
+    if (params.expert_pack_manifest != nullptr && params.expert_pack_manifest[0] != '\0') {
+        if (params.expert_cache_capacity == 0) {
+            throw std::runtime_error("--expert-pack-manifest requires --expert-cache-capacity > 0");
+        }
+        expert_pack = std::make_unique<ExpertPackManifest>(
+                ExpertPackManifest::load(params.expert_pack_manifest));
+        if (ml.file_paths.size() != 1) {
+            throw std::runtime_error(
+                    "Expert pack manifest v1 currently requires one path-backed GGUF file");
+        }
+        std::error_code file_size_error;
+        const uint64_t model_size = std::filesystem::file_size(
+                ml.file_paths.front(), file_size_error);
+        if (file_size_error || model_size != expert_pack->model_size_bytes()) {
+            throw std::runtime_error(format(
+                    "Expert pack model size mismatch: manifest=%" PRIu64 ", model=%" PRIu64,
+                    expert_pack->model_size_bytes(), model_size));
+        }
+        if (expert_pack->architecture() != arch_name()) {
+            throw std::runtime_error(format(
+                    "Expert pack architecture mismatch: manifest=%s, model=%s",
+                    expert_pack->architecture().c_str(), arch_name().c_str()));
+        }
+        LLAMA_LOG_INFO(
+                "%s: validated Expert pack manifest: path=%s, pack=%s, model_sha256=%s, objects=%zu, alignment=%zu\n",
+                __func__, expert_pack->manifest_path().c_str(), expert_pack->pack_path().c_str(),
+                expert_pack->model_sha256().c_str(), expert_pack->objects().size(),
+                expert_pack->alignment());
+    }
+
     if (!expert_manager && params.expert_cache_capacity > 0) {
         if (hparams.n_expert == 0 || hparams.n_ff_exp == 0) {
             LLAMA_LOG_WARN("%s: expert cache capacity was set, but this model has no routed MoE experts; ignoring expert cache\n", __func__);
         } else {
             constexpr size_t expert_cache_alignment = 4096;
             TensorLayout expert_cache_layout;
-            expert_cache_layout.kind = TensorLayoutKind::NonContiguous;
-            expert_cache_layout.parts = { MoePart::Up, MoePart::Gate, MoePart::Down, MoePart::GateUp };
+            expert_cache_layout.kind = expert_pack
+                ? TensorLayoutKind::Contiguous
+                : TensorLayoutKind::NonContiguous;
+            expert_cache_layout.parts = expert_pack ? expert_pack->part_order()
+                : std::vector<MoePart>{ MoePart::Up, MoePart::Gate, MoePart::Down, MoePart::GateUp };
 
             size_t slot_size = 0;
             size_t registered_tensor_count = 0;
@@ -9024,8 +9475,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         if (ml.file_paths.empty()) {
             throw std::runtime_error("MoE expert cache requires path-backed GGUF files");
         }
-        for (size_t file_id = 0; file_id < ml.file_paths.size(); ++file_id) {
-            expert_manager->register_file(static_cast<int32_t>(file_id), ml.file_paths[file_id]);
+        if (expert_pack) {
+            expert_manager->register_file(0, expert_pack->pack_path());
+        } else {
+            for (size_t file_id = 0; file_id < ml.file_paths.size(); ++file_id) {
+                expert_manager->register_file(static_cast<int32_t>(file_id), ml.file_paths[file_id]);
+            }
         }
 
         auto tensor_for_part = [](llama_layer & layer, MoePart part) -> ggml_tensor * {
@@ -9064,12 +9519,39 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
 
             for (int64_t expert = 0; expert < n_expert; ++expert) {
-                ExpertSlice slice = make_expert_slice(
-                        part,
-                        file_id,
-                        tensor_file_offset + static_cast<uint64_t>(expert_stride * expert),
-                        expert_stride);
-                expert_manager->register_slice(layer, static_cast<int32_t>(expert), slice);
+                const uint64_t source_offset =
+                    tensor_file_offset + static_cast<uint64_t>(expert_stride * expert);
+                ExpertSlice slice;
+                if (expert_pack) {
+                    const ExpertPackPart * packed = expert_pack->find_part(
+                            layer, static_cast<int32_t>(expert), part);
+                    if (packed == nullptr) {
+                        throw std::runtime_error(format(
+                                "Expert pack is missing layer=%d expert=%" PRId64 " part=%d",
+                                layer, expert, static_cast<int>(part)));
+                    }
+                    if (packed->tensor_name != name ||
+                        packed->source_offset != source_offset ||
+                        packed->valid_length != expert_stride) {
+                        throw std::runtime_error(format(
+                                "Expert pack metadata mismatch for layer=%d expert=%" PRId64
+                                " part=%d tensor=%s",
+                                layer, expert, static_cast<int>(part), name.c_str()));
+                    }
+                    slice = make_expert_slice(
+                            part,
+                            0,
+                            packed->pack_offset,
+                            packed->valid_length);
+                } else {
+                    slice = make_expert_slice(
+                            part,
+                            file_id,
+                            source_offset,
+                            expert_stride);
+                }
+                expert_manager->register_slice(
+                        layer, static_cast<int32_t>(expert), slice);
             }
 
             {
@@ -10136,6 +10618,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.expert_manager              =*/ nullptr,
+        /*.expert_pack_manifest        =*/ nullptr,
         /*.expert_cache_capacity       =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,

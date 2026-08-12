@@ -1460,6 +1460,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;
     mparams.expert_cache_capacity       = params.expert_cache_capacity;
+    mparams.expert_pack_manifest        = params.expert_pack_manifest.empty() ? nullptr : params.expert_pack_manifest.c_str();
     mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;

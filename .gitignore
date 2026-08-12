@@ -160,3 +160,12 @@ AGENTS.local.md
 
 # Rust
 target/
+
+# PDCat raw experiment artifacts
+/experiments/pdcat/runs/
+/experiments/pdcat/*.jsonl
+/experiments/pdcat/oracle_*.stdout
+/experiments/pdcat/oracle_*.stderr
+/log/
+/runlog
+/uring_io.csv

@@ -1534,7 +1534,7 @@ static void ggml_compute_forward_mul_mat_id(
         incr_ptr_aligned(&wdata_cur, sizeof(void *), sizeof(void *));
     void * moe_expert_wdata = wdata_cur;
     if (ith == 0) {
-        *moe_expert_handle_slot = ggml_moe_expert_ensure(src0, ids);
+        *moe_expert_handle_slot = ggml_moe_expert_ensure(src0, ids, dst->src[3]);
     }
     ggml_barrier(params->threadpool);
     void * moe_expert_handle = *moe_expert_handle_slot;

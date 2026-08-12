@@ -702,7 +702,11 @@ extern "C" {
     // MoE expert callback
     // Called by GGML_OP_MUL_MAT_ID before reading expert weights. The returned
     // opaque handle is released after the op finishes.
-    typedef void *       (*ggml_moe_expert_ensure_callback)(void * data, const struct ggml_tensor * src0, const struct ggml_tensor * ids);
+    typedef void *       (*ggml_moe_expert_ensure_callback)(
+            void * data,
+            const struct ggml_tensor * src0,
+            const struct ggml_tensor * ids,
+            const struct ggml_tensor * router_scores);
     typedef const void * (*ggml_moe_expert_get_data_callback)(void * data, void * handle, int32_t expert, const void * fallback);
     typedef const void * (*ggml_moe_expert_get_device_data_callback)(void * data, void * handle, int32_t expert, const void * fallback);
     typedef const void * (*ggml_moe_expert_wait_any_ready_callback)(void * data, void * handle, const int32_t * experts, int32_t count, int32_t * expert_out);
@@ -716,7 +720,10 @@ extern "C" {
             ggml_moe_expert_release_callback release,
             void * data);
 
-    GGML_API void * ggml_moe_expert_ensure(const struct ggml_tensor * src0, const struct ggml_tensor * ids);
+    GGML_API void * ggml_moe_expert_ensure(
+            const struct ggml_tensor * src0,
+            const struct ggml_tensor * ids,
+            const struct ggml_tensor * router_scores);
     GGML_API const void * ggml_moe_expert_get_data(void * handle, int32_t expert, const void * fallback);
     GGML_API const void * ggml_moe_expert_get_device_data(void * handle, int32_t expert, const void * fallback);
     GGML_API const void * ggml_moe_expert_wait_any_ready(void * handle, const int32_t * experts, int32_t count, int32_t * expert_out);
@@ -1449,6 +1456,15 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // router_scores is optional and, when present, is aligned with ids:
+    // [1, n_expert_used, n_tokens] (F32).
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_with_router_scores(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * router_scores);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

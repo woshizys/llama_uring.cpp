@@ -100,6 +100,8 @@ struct ggml_cuda_moe_stats {
     std::atomic<uint64_t> ids_d2h_calls{0};
     std::atomic<uint64_t> ids_d2h_bytes{0};
     std::atomic<uint64_t> ids_d2h_sync_ns{0};
+    std::atomic<uint64_t> router_scores_d2h_calls{0};
+    std::atomic<uint64_t> router_scores_d2h_bytes{0};
 
     std::atomic<uint64_t> ensure_calls{0};
     std::atomic<uint64_t> ensure_ns{0};
@@ -144,6 +146,29 @@ static uint64_t ggml_cuda_moe_stats_interval() {
     return interval;
 }
 
+enum class ggml_cuda_moe_delivery {
+    mapped,
+    promote,
+};
+
+static ggml_cuda_moe_delivery ggml_cuda_moe_delivery_mode() {
+    static const ggml_cuda_moe_delivery mode = [] {
+        const char * env = std::getenv("LLAMA_MOE_CUDA_DELIVERY");
+        if (env == nullptr || env[0] == '\0' || std::strcmp(env, "mapped") == 0) {
+            return ggml_cuda_moe_delivery::mapped;
+        }
+        if (std::strcmp(env, "promote") == 0) {
+            return ggml_cuda_moe_delivery::promote;
+        }
+        std::fprintf(
+                stderr,
+                "unknown LLAMA_MOE_CUDA_DELIVERY='%s'; using mapped direct-use\n",
+                env);
+        return ggml_cuda_moe_delivery::mapped;
+    }();
+    return mode;
+}
+
 static ggml_cuda_moe_stats & ggml_cuda_moe_stats_instance() {
     static ggml_cuda_moe_stats stats;
     return stats;
@@ -166,6 +191,7 @@ static void ggml_cuda_moe_stats_print(const char * reason) {
     const double active_avg = external_ops > 0 ? double(active_total) / double(external_ops) : 0.0;
 
     const double ids_mib = s.ids_d2h_bytes.load(std::memory_order_relaxed) / 1048576.0;
+    const double router_scores_mib = s.router_scores_d2h_bytes.load(std::memory_order_relaxed) / 1048576.0;
     const double ptr_mib = s.ptr_table_h2d_bytes.load(std::memory_order_relaxed) / 1048576.0;
     const double ids_ms = s.ids_d2h_sync_ns.load(std::memory_order_relaxed) / 1000000.0;
     const double ensure_ms = s.ensure_ns.load(std::memory_order_relaxed) / 1000000.0;
@@ -175,7 +201,8 @@ static void ggml_cuda_moe_stats_print(const char * reason) {
     std::fprintf(
             stderr,
             "%s: CUDA MoE stats[%s]: mul_mat_id=%" PRIu64 " native=%" PRIu64 " external=%" PRIu64
-            " ids_cache_hit/miss=%" PRIu64 "/%" PRIu64 " ids_d2h=%" PRIu64 " %.3f MiB %.3f ms"
+            " ids_cache_hit/miss=%" PRIu64 "/%" PRIu64 " ids_d2h=%" PRIu64 " %.3f MiB"
+            " router_scores_d2h=%" PRIu64 " %.3f MiB d2h_sync=%.3f ms"
             " ensure=%" PRIu64 " %.3f ms active_avg/max=%.2f/%" PRIu64
             " get_device=%" PRIu64 " %.3f ms ptr_h2d=%" PRIu64 " %.3f MiB %.3f ms"
             " paths(mmvq/mmq/fallback)=%" PRIu64 "/%" PRIu64 "/%" PRIu64 " release_events=%" PRIu64 "\n",
@@ -187,6 +214,8 @@ static void ggml_cuda_moe_stats_print(const char * reason) {
             s.ids_cache_misses.load(std::memory_order_relaxed),
             s.ids_d2h_calls.load(std::memory_order_relaxed),
             ids_mib,
+            s.router_scores_d2h_calls.load(std::memory_order_relaxed),
+            router_scores_mib,
             ids_ms,
             s.ensure_calls.load(std::memory_order_relaxed),
             ensure_ms,
@@ -227,6 +256,13 @@ struct ggml_cuda_moe_ids_cache_entry {
     int64_t ne[GGML_MAX_DIMS] = {};
     int64_t nb[GGML_MAX_DIMS] = {};
     std::vector<char> data;
+
+    bool has_router_scores = false;
+    size_t router_scores_nbytes = 0;
+    int64_t router_scores_ne[GGML_MAX_DIMS] = {};
+    int64_t router_scores_nb[GGML_MAX_DIMS] = {};
+    std::vector<char> router_scores_data;
+
     std::vector<const ggml_tensor *> seen_src0;
 };
 
@@ -240,13 +276,32 @@ static std::unordered_map<const ggml_tensor *, ggml_cuda_moe_ids_cache_entry> & 
     return cache;
 }
 
-static bool ggml_cuda_moe_ids_cache_entry_matches(const ggml_cuda_moe_ids_cache_entry & entry, const ggml_tensor * ids) {
+static bool ggml_cuda_moe_ids_cache_entry_matches(
+        const ggml_cuda_moe_ids_cache_entry & entry,
+        const ggml_tensor * ids,
+        const ggml_tensor * router_scores) {
     if (entry.nbytes != ggml_nbytes(ids) || entry.data.size() != entry.nbytes) {
         return false;
     }
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         if (entry.ne[i] != ids->ne[i] || entry.nb[i] != (int64_t) ids->nb[i]) {
             return false;
+        }
+    }
+
+    if (entry.has_router_scores != (router_scores != nullptr)) {
+        return false;
+    }
+    if (router_scores != nullptr) {
+        if (entry.router_scores_nbytes != ggml_nbytes(router_scores)
+                || entry.router_scores_data.size() != entry.router_scores_nbytes) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (entry.router_scores_ne[i] != router_scores->ne[i]
+                    || entry.router_scores_nb[i] != (int64_t) router_scores->nb[i]) {
+                return false;
+            }
         }
     }
     return true;
@@ -302,9 +357,25 @@ private:
                 items.pop_front();
             }
 
-            CUDA_CHECK(cudaEventSynchronize(item.event));
-            ggml_moe_expert_release(item.handle);
-            CUDA_CHECK(cudaEventDestroy(item.event));
+            const cudaError_t status = cudaEventQuery(item.event);
+            if (status == cudaSuccess) {
+                ggml_moe_expert_release(item.handle);
+                CUDA_CHECK(cudaEventDestroy(item.event));
+                continue;
+            }
+            if (status != cudaErrorNotReady) {
+                CUDA_CHECK(status);
+            }
+
+            // Events can come from multiple CUDA streams. Blocking on the
+            // oldest event causes head-of-line blocking: later ready events
+            // retain their Expert handles and can exhaust a full cache. Requeue
+            // unfinished events so every stream gets a chance to release.
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                items.push_back(item);
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
     }
 
@@ -2026,7 +2097,8 @@ static void ggml_cuda_op_mul_mat(
         }
 
         // If src0 is on a temporary compute buffer (partial offloading) there may be some padding that needs to be cleared:
-        if (ne00 % MATRIX_ROW_PADDING != 0 && ggml_is_quantized(src0->type) && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE && src0->view_src == nullptr) {
+        if (src0->buffer != nullptr && ne00 % MATRIX_ROW_PADDING != 0 && ggml_is_quantized(src0->type) &&
+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE && src0->view_src == nullptr) {
             GGML_ASSERT(ggml_is_contiguously_allocated(src0));
             GGML_ASSERT(!src0->view_src);
             const size_t nbytes_data    = ggml_row_size(src0->type, (dev[id].row_high - dev[id].row_low)*ne00);
@@ -2604,9 +2676,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-                                   ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
-                                   src0->view_src;
+    const bool bad_padding_clear = src0->buffer != nullptr &&
+        ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+        src0->view_src;
 
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
@@ -2626,8 +2699,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     }
 
 
-    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
-                       ggml_backend_buft_is_cuda_split(src1->buffer->buft);
+    const bool split =
+        (src0->buffer != nullptr && ggml_backend_buft_is_cuda_split(src0->buffer->buft)) ||
+        (src1->buffer != nullptr && ggml_backend_buft_is_cuda_split(src1->buffer->buft));
 
     //TODO: add support for fusion for split buffers
     if (split) {
@@ -2638,12 +2712,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+    const bool split = src0->buffer != nullptr && ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+    const bool bad_padding_clear = src0->buffer != nullptr
+        && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
 
     bool use_mul_mat_vec_f = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)
@@ -2723,18 +2798,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 }
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-    const ggml_tensor * ids  = dst->src[2];
+    const ggml_tensor * src0          = dst->src[0];
+    const ggml_tensor * src1          = dst->src[1];
+    const ggml_tensor * ids           = dst->src[2];
+    const ggml_tensor * router_scores = dst->src[3];
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
-    GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
+    GGML_ASSERT(router_scores == nullptr || router_scores->type == GGML_TYPE_F32);
+    GGML_ASSERT((src0->buffer == nullptr || !ggml_backend_buft_is_cuda_split(src0->buffer->buft)) &&
+        "mul_mat_id does not support split buffers");
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool use_external_moe = (src0->flags & GGML_TENSOR_FLAG_EXTERNAL) != 0;
+    const bool trace_native_moe = !use_external_moe
+        && getenv("LLAMA_MOE_GATE_TRACE_JSONL") != nullptr;
     cudaStream_t stream = ctx.stream();
     auto & moe_stats = ggml_cuda_moe_stats_instance();
     moe_stats.mul_mat_id_ops.fetch_add(1, std::memory_order_relaxed);
@@ -2745,23 +2825,26 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     std::vector<char> ids_host;
+    std::vector<char> router_scores_host;
     void * moe_expert_handle = nullptr;
+    ggml_cuda_pool_alloc<char> moe_expert_promoted_dev(ctx.pool());
     ggml_cuda_pool_alloc<const void *> moe_expert_ptrs_dev(ctx.pool());
     const void * const * moe_expert_ptrs = nullptr;
 
-    if (use_external_moe) {
+    if (use_external_moe || trace_native_moe) {
         bool ids_cache_hit = false;
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_moe_ids_cache_mutex());
             auto & cache = ggml_cuda_moe_ids_cache();
             auto it = cache.find(ids);
             if (it != cache.end()
-                    && ggml_cuda_moe_ids_cache_entry_matches(it->second, ids)
+                    && ggml_cuda_moe_ids_cache_entry_matches(it->second, ids, router_scores)
                     && !ggml_cuda_moe_ids_cache_seen_src0(it->second, src0)) {
                 ids_host = it->second.data;
+                router_scores_host = it->second.router_scores_data;
                 it->second.seen_src0.push_back(src0);
                 ids_cache_hit = true;
-            } else if (it != cache.end() && !ggml_cuda_moe_ids_cache_entry_matches(it->second, ids)) {
+            } else if (it != cache.end() && !ggml_cuda_moe_ids_cache_entry_matches(it->second, ids, router_scores)) {
                 cache.erase(it);
             }
         }
@@ -2770,11 +2853,24 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             ids_host.resize(ggml_nbytes(ids));
             const uint64_t t0 = ggml_cuda_moe_now_ns();
             CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+            if (router_scores != nullptr) {
+                router_scores_host.resize(ggml_nbytes(router_scores));
+                CUDA_CHECK(cudaMemcpyAsync(
+                        router_scores_host.data(),
+                        router_scores->data,
+                        ggml_nbytes(router_scores),
+                        cudaMemcpyDeviceToHost,
+                        stream));
+            }
             CUDA_CHECK(cudaStreamSynchronize(stream));
             const uint64_t t1 = ggml_cuda_moe_now_ns();
             moe_stats.ids_cache_misses.fetch_add(1, std::memory_order_relaxed);
             moe_stats.ids_d2h_calls.fetch_add(1, std::memory_order_relaxed);
             moe_stats.ids_d2h_bytes.fetch_add(ggml_nbytes(ids), std::memory_order_relaxed);
+            if (router_scores != nullptr) {
+                moe_stats.router_scores_d2h_calls.fetch_add(1, std::memory_order_relaxed);
+                moe_stats.router_scores_d2h_bytes.fetch_add(ggml_nbytes(router_scores), std::memory_order_relaxed);
+            }
             moe_stats.ids_d2h_sync_ns.fetch_add(t1 - t0, std::memory_order_relaxed);
 
             ggml_cuda_moe_ids_cache_entry entry;
@@ -2784,6 +2880,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 entry.nb[i] = ids->nb[i];
             }
             entry.data = ids_host;
+            entry.has_router_scores = router_scores != nullptr;
+            if (router_scores != nullptr) {
+                entry.router_scores_nbytes = router_scores_host.size();
+                for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                    entry.router_scores_ne[i] = router_scores->ne[i];
+                    entry.router_scores_nb[i] = router_scores->nb[i];
+                }
+                entry.router_scores_data = router_scores_host;
+            }
             entry.seen_src0.push_back(src0);
 
             std::lock_guard<std::mutex> lock(ggml_cuda_moe_ids_cache_mutex());
@@ -2798,12 +2903,25 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         ggml_tensor ids_host_tensor = *ids;
         ids_host_tensor.data = ids_host.data();
+
+        ggml_tensor router_scores_host_tensor = {};
+        const ggml_tensor * router_scores_for_callback = nullptr;
+        if (router_scores != nullptr) {
+            router_scores_host_tensor = *router_scores;
+            router_scores_host_tensor.data = router_scores_host.data();
+            router_scores_for_callback = &router_scores_host_tensor;
+        }
+
         const uint64_t ensure_t0 = ggml_cuda_moe_now_ns();
-        moe_expert_handle = ggml_moe_expert_ensure(src0, &ids_host_tensor);
+        moe_expert_handle = ggml_moe_expert_ensure(src0, &ids_host_tensor, router_scores_for_callback);
         const uint64_t ensure_t1 = ggml_cuda_moe_now_ns();
         moe_stats.ensure_calls.fetch_add(1, std::memory_order_relaxed);
         moe_stats.ensure_ns.fetch_add(ensure_t1 - ensure_t0, std::memory_order_relaxed);
-        GGML_ASSERT(moe_expert_handle != nullptr && "external CUDA MUL_MAT_ID requires MoE expert callback");
+        if (!use_external_moe) {
+            GGML_ASSERT(moe_expert_handle == nullptr);
+        } else {
+
+            GGML_ASSERT(moe_expert_handle != nullptr && "external CUDA MUL_MAT_ID requires MoE expert callback");
 
         std::vector<const void *> expert_ptrs_host(ne02, nullptr);
         std::vector<bool> active_expert(ne02, false);
@@ -2834,6 +2952,26 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         moe_stats.get_device_calls.fetch_add(active_count, std::memory_order_relaxed);
         moe_stats.get_device_ns.fetch_add(get_device_t1 - get_device_t0, std::memory_order_relaxed);
 
+        if (ggml_cuda_moe_delivery_mode() == ggml_cuda_moe_delivery::promote) {
+            moe_expert_promoted_dev.alloc(active_count * nb02);
+            size_t promoted_offset = 0;
+            for (int64_t expert = 0; expert < ne02; ++expert) {
+                if (!active_expert[expert]) {
+                    continue;
+                }
+                char * promoted = moe_expert_promoted_dev.ptr + promoted_offset;
+                CUDA_CHECK(cudaMemcpyAsync(
+                        promoted,
+                        expert_ptrs_host[expert],
+                        nb02,
+                        cudaMemcpyDefault,
+                        stream));
+                expert_ptrs_host[expert] = promoted;
+                promoted_offset += nb02;
+            }
+            GGML_ASSERT(promoted_offset == active_count * nb02);
+        }
+
         moe_expert_ptrs_dev.alloc(ne02);
         const uint64_t ptr_t0 = ggml_cuda_moe_now_ns();
         CUDA_CHECK(cudaMemcpyAsync(moe_expert_ptrs_dev.ptr, expert_ptrs_host.data(), ne02*sizeof(const void *), cudaMemcpyHostToDevice, stream));
@@ -2842,6 +2980,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         moe_stats.ptr_table_h2d_bytes.fetch_add(ne02*sizeof(const void *), std::memory_order_relaxed);
         moe_stats.ptr_table_h2d_enqueue_ns.fetch_add(ptr_t1 - ptr_t0, std::memory_order_relaxed);
         moe_expert_ptrs = moe_expert_ptrs_dev.ptr;
+        }
     }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -5261,7 +5400,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (a == nullptr || b == nullptr) {
                     return false;
                 }
-                if (op->op == GGML_OP_MUL_MAT_ID && a->buffer == nullptr) {
+                if (op->op == GGML_OP_MUL_MAT_ID &&
+                    a->buffer == nullptr &&
+                    (a->flags & GGML_TENSOR_FLAG_EXTERNAL) == 0) {
                     return false;
                 }
                 if (a->buffer && ggml_backend_buft_is_cuda_split(a->buffer->buft)) {
@@ -5602,7 +5743,8 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
 
     if (op->op == GGML_OP_MUL_MAT_ID &&
         op->src[0] != nullptr &&
-        op->src[0]->buffer == nullptr) {
+        op->src[0]->buffer == nullptr &&
+        (op->src[0]->flags & GGML_TENSOR_FLAG_EXTERNAL) == 0) {
         return false;
     }
 

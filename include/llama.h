@@ -314,6 +314,7 @@ extern "C" {
         // register MoE expert tensor slices during model loading and call
         // ensure/release around CPU GGML_OP_MUL_MAT_ID execution.
         void * expert_manager;
+        const char * expert_pack_manifest;  // optional verified PDCat sidecar manifest
         size_t expert_cache_capacity;       // auto-create ExpertManager when > 0 and expert_manager is NULL
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
@@ -857,6 +858,16 @@ extern "C" {
                const llama_token * tokens,
                           size_t   n_token_count);
 
+
+    // Saves the same sequence-state file format as llama_state_seq_save_file,
+    // but sends the serialized bytes through the shared P4 I/O scheduler.
+    // Requires a model initialized with the expert manager.
+    LLAMA_API size_t llama_state_seq_save_file_p4(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count);
     LLAMA_API size_t llama_state_seq_load_file(
             struct llama_context * ctx,
                       const char * filepath,

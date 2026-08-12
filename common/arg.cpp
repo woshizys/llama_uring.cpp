@@ -2256,6 +2256,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_CAPACITY"));
     add_opt(common_arg(
+        {"--expert-pack-manifest"}, "PATH",
+        "verified PDCat Expert sidecar pack manifest",
+        [](common_params & params, const std::string & value) {
+            params.expert_pack_manifest = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_PACK_MANIFEST"));
+    add_opt(common_arg(
+        {"--pdcat-kv-p4"},
+        "route server slot saves through the shared P4 scheduler (requires expert cache)",
+        [](common_params & params) {
+            params.pdcat_kv_p4 = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PDCAT_KV_P4"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

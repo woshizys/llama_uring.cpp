@@ -4408,7 +4408,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         auto * moe_state = (mmid_moe_ready_state *) params->wdata;
         if (ith == 0) {
-            moe_state->handle = ggml_moe_expert_ensure(src0, ids);
+            moe_state->handle = ggml_moe_expert_ensure(src0, ids, op->src[3]);
             moe_state->cur_src0 = nullptr;
             moe_state->cur_a = -1;
             moe_state->pending_count = 0;

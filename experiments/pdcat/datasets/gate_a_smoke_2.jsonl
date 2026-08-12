@@ -1,0 +1,2 @@
+{"schema_version":1,"prompt_id":"smoke-en-000","prompt":"Explain why deterministic tests matter in one sentence.","prompt_sha256":"","source_id":"pdcat-smoke","split":"smoke","category":"english"}
+{"schema_version":1,"prompt_id":"smoke-zh-001","prompt":"用一句话解释混合专家模型中的路由器作用。","prompt_sha256":"","source_id":"pdcat-smoke","split":"smoke","category":"chinese"}
